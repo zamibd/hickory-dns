@@ -1,0 +1,10 @@
+target/
+**/*.rs.bk
+Cargo.lock
+.git/
+.github/
+.idea/
+.vscode/
+*.swp
+*.log
+.DS_Store

@@ -1,0 +1,71 @@
+# Hickory DNS Configuration
+# Documentation: https://hickory-dns.org/
+
+# Listen on all interfaces
+listen_addrs_ipv4 = ["0.0.0.0"]
+listen_addrs_ipv6 = ["::0"]
+
+# Port to listen on (default 53)
+listen_port = 53
+
+# Access Control
+# Allow all (since we are running in a container, typically acceptable, or limit to private ranges)
+allow_networks = ["0.0.0.0/0", "::/0"]
+
+# --- Zones ---
+
+# 1. Localhost zones (Standard practice)
+[[zones]]
+zone = "localhost"
+zone_type = "Primary"
+file = "default/localhost.zone"
+
+[[zones]]
+zone = "0.0.127.in-addr.arpa"
+zone_type = "Primary"
+file = "default/127.0.0.1.zone"
+
+[[zones]]
+zone = "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
+zone_type = "Primary"
+file = "default/ipv6_1.zone"
+
+[[zones]]
+zone = "255.in-addr.arpa"
+zone_type = "Primary"
+file = "default/255.zone"
+
+[[zones]]
+zone = "0.in-addr.arpa"
+zone_type = "Primary"
+file = "default/0.zone"
+
+
+# 2. Forwarding Zone (Recursive Resolver)
+# This forwards all other queries (".") to upstream resolvers.
+[[zones]]
+zone = "."
+# Note: "External" or "Forward" can be used depending on version, 
+# following example_forwarder.toml pattern but enabling recursion properly.
+zone_type = "External"
+
+[zones.stores]
+type = "forward"
+
+# Upstream: Cloudflare (1.1.1.1)
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+connections = [
+    { protocol = { type = "udp" } },
+    { protocol = { type = "tcp" } },
+]
+
+# Upstream: Google (8.8.8.8)
+[[zones.stores.name_servers]]
+ip = "8.8.8.8"
+trust_negative_responses = true
+connections = [
+    { protocol = { type = "udp" } },
+    { protocol = { type = "tcp" } },
+]
