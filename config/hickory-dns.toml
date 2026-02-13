@@ -1,20 +1,58 @@
-# Hickory DNS Configuration
-# Documentation: https://hickory-dns.org/
+##
+## This is an example configuration file for the Hickory DNS server.
+##
+## The format is in TOML: https://github.com/toml-lang/toml which was chosen
+## as the configuration format for Hickory DNS.
+##
+## Many of these options are available as both command line options and
+## configuration options in these files. In that case, the command line option
+## will take precedence.
+##
+## Comments with two hash marks, ##, document the config parameter
+## Comments with one hash mark, #, is an example line and should be the default
 
-# Listen on all interfaces
-listen_addrs_ipv4 = ["0.0.0.0"]
-listen_addrs_ipv6 = ["::0"]
+## listen_addrs: address on which to listen for incoming connections
+##  this can be a list of ipv4 or ipv6 addresses
+# listen_addrs_ipv4 = ["0.0.0.0"]
+# listen_addrs_ipv6 = ["::0"]
 
-# Port to listen on (default 53)
-listen_port = 53
+## listen_port: port on which to list, default 53
+# listen_port = 53
 
-# Access Control
-# Allow all (since we are running in a container, typically acceptable, or limit to private ranges)
-allow_networks = ["0.0.0.0/0", "::/0"]
+## tcp_request_timeout: TCP request timeout in seconds. Allows TCP connections
+##  to timeout if there are no requests from a client in the specified amount of
+##  time. This is not a socket level timeout, so trickles of data will not count,
+##  a full request must be received for it to not count against the timeout.
+##  Specifying a timeout of 0 will disable it.
+# tcp_request_timeout = 5
 
-# --- Zones ---
+## DNS over TLS certificate information.
+tls_cert = { path = "/config/certs/cert.pem", private_key = "/config/certs/cert_key.pem" }
 
-# 1. Localhost zones (Standard practice)
+## port on which to listen, default 853 (should not be 53)
+tls_listen_port = 853
+
+## whether to support using the SSLKEYLOGFILE environment variable for writing
+## DoT/DoH/DoQ TLS session keys to the specified file for decryption with tools
+## like Wireshark. Enable with care! The recorded data is sensitive.
+# ssl_keylog_enabled = false
+
+## directory: path on the host filesystem to where zone files are stored.
+# directory = "/var/named"
+
+## Denied networks, a list of CIDRs in IPv4 or IPv6 formats,
+##  any request that does not originate from the specified networks will be allowed
+# deny_networks = ["127.0.0.0/8", "::1/128"]
+
+## Allowed networks, a list of CIDRs in IPv4 or IPv6 formats,
+##  any request that does not originate from the specified networks will be denied, unless
+##  there are deny_networks specified, in that case, the allow list will be processed as
+##  an override to the deny_networks. That is, if there is a deny_list and the network does
+##  not appear there, even if does not appear in the allow list the request will be allowed.
+# allow_networks = ["127.0.0.0/8", "::1/128"]
+
+## Default zones, these should be present on all nameservers, except in rare
+##  configuration cases
 [[zones]]
 zone = "localhost"
 zone_type = "Primary"
@@ -40,32 +78,184 @@ zone = "0.in-addr.arpa"
 zone_type = "Primary"
 file = "default/0.zone"
 
+[[zones]]
+## zone: this is the ORIGIN of the zone, aka the base name, '.' is implied on the end
+zone = "example.com"
 
-# 2. Forwarding Zone (Recursive Resolver)
-# This forwards all other queries (".") to upstream resolvers.
+## zone_type: Primary, Secondary, External
+zone_type = "Primary"
+
+## file: this is relative to the directory above
+file = "example.com.zone"
+
+## if "Deny", AXFRs requests will result in Refused responses
+## if "AllowAll", all AXFR requests (signed or unsigned) are allowed.
+axfr_policy = "Deny"
+
+## if true, looks to see if a chained pem file exists at $file.pem (see
+## supported_algorithms below).
+## these keys will also be registered as authorities for update,
+## meaning that SIG(0) updates can be established by initially using these
+## keys. the zone will be signed with all specified keys, it may be desirable
+## to limit this set for performance reasons.
+# enable_dnssec = false
+
+## set of DNSSEC algorithms to use to sign the zone. enable_dnssec must be true.
+## these will be lookedup by $file.{key_name}.pem, for backward compatibility
+## with previous versions of Hickory DNS, if enable_dnssec is enabled but
+## supported_algorithms is not specified, it will default to "RSASHA256" and
+## look for the $file.pem for the key. To control key length, or other options
+## keys of the specified formats can be generated in PEM format. Instructions
+## for custom keys can be found elsewhere.
+##
+## supported extensions are 'der', 'pem'. ED25519 keys are only supported
+## with 'pk8'.
+##
+## the currently supported set of supported_algorithms are
+## ["RSASHA256", "RSASHA512", "ECDSAP256SHA256", "ECDSAP384SHA384", "ED25519"]
+##
+## keys are listed in pairs of key_name and algorithm, the search path is the
+## same directory has the zone $file (this section would be relative to the
+## example.com zone):
+# [[zones.keys]]
+## relative to the zone $file
+# key_path = "my_rsa_2048.pem"
+## the password used to encrypt/decrypt the file (must be PEM), blank for none
+# password = ""
+## specify the algorithm
+# algorithm = "RSASHA256"
+
+
 [[zones]]
 zone = "."
-# Note: "External" or "Forward" can be used depending on version, 
-# following example_forwarder.toml pattern but enabling recursion properly.
 zone_type = "External"
-
 [zones.stores]
 type = "forward"
-
-# Upstream: Cloudflare (1.1.1.1)
 [[zones.stores.name_servers]]
 ip = "1.1.1.1"
 trust_negative_responses = true
-connections = [
-    { protocol = { type = "udp" } },
-    { protocol = { type = "tcp" } },
-]
+[[zones.stores.name_servers.connections]]
+protocol = { type = "udp" }
+[[zones.stores.name_servers.connections]]
+protocol = { type = "tcp" }
 
-# Upstream: Google (8.8.8.8)
 [[zones.stores.name_servers]]
 ip = "8.8.8.8"
 trust_negative_responses = true
-connections = [
-    { protocol = { type = "udp" } },
-    { protocol = { type = "tcp" } },
-]
+[[zones.stores.name_servers.connections]]
+protocol = { type = "udp" }
+[[zones.stores.name_servers.connections]]
+protocol = { type = "tcp" }
+
+
+# DoH Forwarding for specific zones
+
+[[zones]]
+zone = "bka.sh" # Covers *.bka.sh including cmsimages, images, eventapi, api.cde
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1" 
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "ip-api.com"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "connectivitycheck.gstatic.com"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "mynagad.com"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "upaysystem.com" # Covers api.upaysystem.com
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "bkash.com"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "nagad.com.bd"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "dutchbanglabank.com"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "alaap.gov.bd"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
+
+[[zones]]
+zone = "app.brilliant.com.bd"
+zone_type = "External"
+[zones.stores]
+type = "forward"
+[[zones.stores.name_servers]]
+ip = "1.1.1.1"
+trust_negative_responses = true
+[[zones.stores.name_servers.connections]]
+protocol = { type = "https", server_name = "cloudflare-dns.com", path = "/dns-query" }
