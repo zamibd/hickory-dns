@@ -59,12 +59,12 @@ async fn test_shared_lookup() -> Result<(), ProtoError> {
 
     let mut futures = vec![
         pool.lookup(
-            Query::query(query_name.clone(), RecordType::A),
+            Query::new(query_name.clone(), RecordType::A),
             DnsRequestOptions::default(),
         )
         .first_answer(),
         pool.lookup(
-            Query::query(query_name.clone(), RecordType::A),
+            Query::new(query_name.clone(), RecordType::A),
             DnsRequestOptions::default(),
         )
         .first_answer(),
@@ -74,7 +74,7 @@ async fn test_shared_lookup() -> Result<(), ProtoError> {
 
     let mut ok_count = 0;
     while let Some(Ok(response)) = futures.next().await {
-        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.response_code, ResponseCode::NoError);
         ok_count += 1;
     }
 

@@ -12,7 +12,7 @@ use async_recursion::async_recursion;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use lru_cache::LruCache;
 use parking_lot::Mutex;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 
 use super::{DnssecPolicy, RecursorError, RecursorOptions, error::AuthorityData, is_subzone};
 #[cfg(feature = "metrics")]
@@ -84,6 +84,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             cache_policy,
             case_randomization,
             opportunistic_encryption,
+            edns_payload_len,
         } = options;
 
         let avoid_local_udp_ports = Arc::new(avoid_local_udp_ports);
@@ -94,7 +95,11 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         );
 
         let mut pool_context = PoolContext::new(
-            recursor_opts(avoid_local_udp_ports.clone(), case_randomization),
+            recursor_opts(
+                avoid_local_udp_ports.clone(),
+                case_randomization,
+                edns_payload_len,
+            ),
             tls,
         )
         .with_probe_budget(
@@ -106,7 +111,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             AccessControlSetBuilder::new("answers")
                 .allow(allow_answers.iter()) // no recommended exceptions
                 .deny(deny_answers.iter()) // no recommend default filters
-                .build(),
+                .build()?,
         );
         pool_context.opportunistic_encryption = opportunistic_encryption;
         if let Some(state) = encrypted_transport_state {
@@ -122,12 +127,12 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         // DnsRequestOptions to use with outbound requests made by the recursor.
         let mut request_options = DnsRequestOptions::default();
-        request_options.use_edns = dnssec_policy.is_security_aware();
         request_options.edns_set_dnssec_ok = dnssec_policy.is_security_aware();
         // Set RD=0 in queries made by the recursive resolver. See the last figure in
         // section 2.2 of RFC 1035, for example. Failure to do so may allow for loops
         // between recursive resolvers following referrals to each other.
         request_options.recursion_desired = false;
+        request_options.edns_payload_len = edns_payload_len;
 
         Ok(Self {
             roots,
@@ -140,7 +145,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             name_server_filter: AccessControlSetBuilder::new("name_servers")
                 .allow(allow_server.iter())
                 .deny(deny_server.iter())
-                .build(),
+                .build()?,
             pool_context,
             conn_provider,
             connection_cache: Arc::new(Mutex::new(LruCache::new(ns_cache_size))),
@@ -162,7 +167,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         if let Some(result) = self.response_cache.get(&query, request_time) {
             let response = result?;
-            if response.authoritative() {
+            if response.authoritative {
                 #[cfg(feature = "metrics")]
                 {
                     self.metrics.cache_hit_counter.increment(1);
@@ -226,9 +231,9 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         // The subsequent lookup request for then ask the example.com. servers to resolve
         // A example.com.
 
-        let zone = match query.query_type() {
-            RecordType::DS => query.name().base_name(),
-            _ => query.name().clone(),
+        let zone = match query.query_type {
+            RecordType::DS => query.name.base_name(),
+            _ => query.name.clone(),
         };
 
         let (depth, ns) = match self
@@ -304,34 +309,37 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         mut depth: u8,
         cname_limit: Arc<AtomicU8>,
     ) -> Result<Message, RecursorError> {
-        let query_type = query.query_type();
-        let query_name = query.name().clone();
+        let query_type = query.query_type;
 
         // Don't resolve CNAME lookups for a CNAME (or ANY) query
         if query_type == RecordType::CNAME || query_type == RecordType::ANY {
             return Ok(response);
         }
 
+        // Return early if there aren't any CNAME in the response.
+        let has_cname = response
+            .all_sections()
+            .any(|rec| matches!(rec.data, CNAME(_)));
+        if !has_cname {
+            return Ok(response);
+        }
+
         depth += 1;
-        RecursorError::recursion_exceeded(self.recursion_limit, depth, &query_name)?;
+        RecursorError::recursion_exceeded(self.recursion_limit, depth, &query.name)?;
 
         let mut cname_chain = vec![];
 
         for rec in response.all_sections() {
-            let CNAME(name) = rec.data() else {
+            let CNAME(name) = &rec.data else {
                 continue;
             };
 
             // Check if the response has data for the canonical name.
-            if response
-                .answers()
-                .iter()
-                .any(|record| record.name() == &name.0)
-            {
+            if response.answers.iter().any(|record| record.name == name.0) {
                 continue;
             }
 
-            let cname_query = Query::query(name.0.clone(), query_type);
+            let cname_query = Query::new(name.0.clone(), query_type);
 
             let count = cname_limit.fetch_add(1, Ordering::Relaxed) + 1;
             if count > MAX_CNAME_LOOKUPS {
@@ -364,13 +372,13 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
             // Here, we're looking for either the terminal record type (matching the
             // original query, or another CNAME.
-            cname_chain.extend(response.answers().iter().filter_map(|r| {
+            cname_chain.extend(response.answers.iter().filter_map(|r| {
                 if r.record_type() == query_type || r.record_type() == RecordType::CNAME {
                     return Some(r.to_owned());
                 }
 
                 #[cfg(feature = "__dnssec")]
-                if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = r.data() {
+                if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &r.data {
                     let type_covered = rrsig.input().type_covered;
                     if type_covered == query_type || type_covered == RecordType::CNAME {
                         return Some(r.to_owned());
@@ -382,7 +390,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         }
 
         if !cname_chain.is_empty() {
-            response.answers_mut().extend(cname_chain);
+            response.answers.extend(cname_chain);
         }
 
         Ok(response)
@@ -400,7 +408,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             None => return None,
         };
 
-        if !response.authoritative() {
+        if !response.authoritative {
             return None;
         }
 
@@ -436,8 +444,8 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         };
 
         let answer_filter = |record: &Record| {
-            if !is_subzone(&zone, record.name()) {
-                error!(
+            if !is_subzone(&zone, &record.name) {
+                debug!(
                     %record, %zone,
                     "dropping out of bailiwick record",
                 );
@@ -447,27 +455,27 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             true
         };
 
-        let answers_len = response.answers().len();
-        let authorities_len = response.authorities().len();
+        let answers_len = response.answers.len();
+        let authorities_len = response.authorities.len();
 
-        response.additionals_mut().retain(answer_filter);
-        response.answers_mut().retain(answer_filter);
-        response.authorities_mut().retain(answer_filter);
+        response.additionals.retain(answer_filter);
+        response.answers.retain(answer_filter);
+        response.authorities.retain(answer_filter);
 
         // If we stripped all of the answers out, or if we stripped all of the authorities
         // out and there are no answers, return an NXDomain response.
-        if response.answers().is_empty() && answers_len != 0
-            || (response.answers().is_empty()
-                && response.authorities().is_empty()
+        if response.answers.is_empty() && answers_len != 0
+            || (response.answers.is_empty()
+                && response.authorities.is_empty()
                 && authorities_len != 0)
         {
-            return Err(RecursorError::Negative(AuthorityData::new(
-                Box::new(query),
-                None,
-                false,
-                true,
-                None,
-            )));
+            return Err(RecursorError::Negative(AuthorityData {
+                query: Box::new(query),
+                soa: None,
+                no_records_found: false,
+                nx_domain: true,
+                authorities: None,
+            }));
         }
 
         let message = response.into_message();
@@ -483,16 +491,14 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         request_time: Instant,
         mut depth: u8,
     ) -> Result<(u8, NameServerPool<P>), RecursorError> {
-        // Build a list of every zone between the root and the query name (but not including the root.)
-        let mut zones = vec![];
-        for i in 1..=query_name.num_labels() {
-            zones.push(query_name.trim_to(i as usize));
-        }
-        trace!(?zones, "looking for zones");
+        // Iterate through zones from TLD down to the query name (not including root)
+        let num_labels = query_name.num_labels();
+        trace!(num_labels, %query_name, "looking for zones");
 
         let mut nameserver_pool = self.roots.clone().with_zone(Name::root());
 
-        for zone in zones {
+        for i in 1..=num_labels {
+            let zone = query_name.trim_to(i as usize);
             if let Some(ns) = self.name_server_cache.lock().get_mut(&zone) {
                 match ns.ttl_expired() {
                     true => debug!(?zone, "cached name server pool expired"),
@@ -510,7 +516,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
             let parent_zone = zone.base_name();
 
-            let query = Query::query(zone.clone(), RecordType::NS);
+            let query = Query::new(zone.clone(), RecordType::NS);
 
             // Query for nameserver records via the pool for the parent zone.
             let lookup_res = match self.response_cache.get(&query, request_time) {
@@ -543,7 +549,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
             let any_ns = response
                 .all_sections()
-                .any(|record| record.record_type() == RecordType::NS);
+                .any(|record| record.record_type() == RecordType::NS && record.name == zone);
             if !any_ns {
                 // Not a zone cut, but there is a CNAME or other record at this name. Return the
                 // same pool of name servers as above in the error case, to try again with a
@@ -569,27 +575,27 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             }
 
             for zns in response.all_sections() {
-                let RData::NS(ns_data) = zns.data() else {
+                let RData::NS(ns_data) = &zns.data else {
                     continue;
                 };
 
-                if !is_subzone(&zone.base_name(), zns.name()) {
-                    warn!(
-                        name = ?zns.name(),
+                if !is_subzone(&zone.base_name(), &zns.name) {
+                    debug!(
+                        name = ?zns.name,
                         parent = ?zone.base_name(),
                         "dropping out of bailiwick record",
                     );
                     continue;
                 }
 
-                if zns.ttl() < ns_pool_ttl {
-                    ns_pool_ttl = zns.ttl();
+                if zns.ttl < ns_pool_ttl {
+                    ns_pool_ttl = zns.ttl;
                 }
 
                 for record_type in [RecordType::A, RecordType::AAAA] {
                     if let Some(Ok(response)) = self
                         .response_cache
-                        .get(&Query::query(ns_data.0.clone(), record_type), request_time)
+                        .get(&Query::new(ns_data.0.clone(), record_type), request_time)
                     {
                         let ttl = self.add_glue_to_map(&mut glue_ips, response.all_sections());
                         if ttl < ns_pool_ttl {
@@ -648,7 +654,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                         let ns = Arc::new(NameServer::new(
                             [],
                             server.clone(),
-                            &self.pool_context.clone().options,
+                            &self.pool_context.options,
                             self.conn_provider.clone(),
                         ));
                         cache.insert(server.ip, ns.clone());
@@ -694,19 +700,25 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         let mut ttl = u32::MAX;
 
         for record in records {
-            let ip = match record.data() {
+            let ip = match &record.data {
                 RData::A(A(ipv4)) => (*ipv4).into(),
                 RData::AAAA(AAAA(ipv6)) => (*ipv6).into(),
                 _ => continue,
             };
             if self.name_server_filter.denied(ip) {
-                debug!(name = %record.name(), %ip, "ignoring address due to do_not_query");
+                debug!(name = %record.name, %ip, "ignoring address due to do_not_query");
                 continue;
             }
-            if record.ttl() < ttl {
-                ttl = record.ttl();
+            if record.ttl < ttl {
+                ttl = record.ttl;
             }
-            let ns_glue_ips = glue_map.entry(record.name().clone()).or_default();
+            let ns_glue_ips = match glue_map.get_mut(&record.name) {
+                Some(ips) => ips,
+                None => {
+                    glue_map.insert(record.name.clone(), Vec::new());
+                    glue_map.get_mut(&record.name).unwrap()
+                }
+            };
             if !ns_glue_ips.contains(&ip) {
                 ns_glue_ips.push(ip);
             }
@@ -734,10 +746,20 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             // To avoid incrementing the depth counter for each nameserver, we'll use the passed in
             // depth as a fixed base for the nameserver lookups
             let nameserver_pool = if !is_subzone(zone, &record_name) {
-                self.ns_pool_for_name(record_name.clone(), request_time, depth)
-                    .await?
-                    .1 // discard the depth part of the tuple
-                    .with_zone(zone.clone())
+                match self
+                    .ns_pool_for_name(record_name.clone(), request_time, depth)
+                    .await
+                {
+                    Ok((_, pool)) => pool.with_zone(zone.clone()),
+                    // The NS hostname could not be resolved. This doesn't mean the
+                    // original queried domain doesn't exist, only that this nameserver
+                    // is unreachable. Skip it and try others. If they all fail, the
+                    // empty pool will result in SERVFAIL.
+                    Err(error) => {
+                        debug!(?record_name, ?error, "nameserver hostname lookup failure");
+                        continue;
+                    }
+                }
             } else {
                 nameserver_pool.clone()
             };
@@ -750,7 +772,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         for (pool, query) in pool_queries.iter() {
             for rec_type in [RecordType::A, RecordType::AAAA] {
                 futures.push(Box::pin(
-                    pool.lookup(Query::query(query.clone(), rec_type), self.request_options)
+                    pool.lookup(Query::new(query.clone(), rec_type), self.request_options)
                         .into_future()
                         .map(|(first, _rest)| first),
                 ));
@@ -761,20 +783,20 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
 
         while let Some(next) = futures.next().await {
             match next {
-                Some(Ok(mut response)) => {
+                Some(Ok(response)) => {
                     debug!("append_ips_from_lookup: A or AAAA response: {response:?}");
-                    config.extend(response
-                        .take_answers()
+                    config.extend(response.into_message()
+                        .answers
                         .into_iter()
                         .filter_map(|answer| {
-                            let ip = answer.data().ip_addr()?;
+                            let ip = answer.data.ip_addr()?;
 
                             if self.name_server_filter.denied(ip) {
                                 debug!(%ip, "append_ips_from_lookup: ignoring address due to do_not_query");
                                 None
                             } else {
-                                if answer.ttl() < ttl {
-                                    ttl = answer.ttl();
+                                if answer.ttl < ttl {
+                                    ttl = answer.ttl;
                                 }
                                 Some(ip)
                             }
@@ -811,8 +833,8 @@ mod for_dnssec {
         type Runtime = P::RuntimeProvider;
 
         fn send(&self, request: DnsRequest) -> Self::Response {
-            let query = if let OpCode::Query = request.op_code() {
-                if let Some(query) = request.queries().first().cloned() {
+            let query = if let OpCode::Query = request.op_code {
+                if let Some(query) = request.queries.first().cloned() {
                     query
                 } else {
                     return Box::pin(stream::once(future::err(NetError::from(
@@ -841,11 +863,11 @@ mod for_dnssec {
                 // we can put "stubs" in the other fields
                 let mut msg = Message::query();
 
-                msg.add_answers(response.answers().iter().cloned());
-                msg.add_authorities(response.authorities().iter().cloned());
-                msg.add_additionals(response.additionals().iter().cloned());
+                msg.add_answers(response.answers.iter().cloned());
+                msg.add_authorities(response.authorities.iter().cloned());
+                msg.add_additionals(response.additionals.iter().cloned());
 
-                DnsResponse::from_message(msg).map_err(NetError::from)
+                DnsResponse::from_message(msg.into_response()).map_err(NetError::from)
             })
             .boxed()
         }
@@ -855,6 +877,7 @@ mod for_dnssec {
 fn recursor_opts(
     avoid_local_udp_ports: Arc<HashSet<u16>>,
     case_randomization: bool,
+    edns_payload_len: u16,
 ) -> ResolverOpts {
     ResolverOpts {
         ndots: 0,
@@ -866,6 +889,7 @@ fn recursor_opts(
         num_concurrent_reqs: 1,
         avoid_local_udp_ports,
         case_randomization,
+        edns_payload_len,
         ..ResolverOpts::default()
     }
 }

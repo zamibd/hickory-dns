@@ -3,15 +3,21 @@
 
 extern crate test;
 
-use hickory_proto::op::{Header, Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::{Name, Record, RecordType};
+use hickory_proto::op::{
+    Header, HeaderCounts, Message, MessageType, Metadata, OpCode, ResponseCode,
+};
+use hickory_proto::rr::rdata::PTR;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 
 use test::Bencher;
 
 #[bench]
 fn bench_emit_header(b: &mut Bencher) {
-    let header = Header::new(10, MessageType::Query, OpCode::Query);
+    let header = Header {
+        metadata: Metadata::new(10, MessageType::Query, OpCode::Query),
+        counts: HeaderCounts::default(),
+    };
     b.iter(|| {
         // we need to create the vector here, otherwise its length is already big enough and the
         // encoder does not need to resize it
@@ -27,7 +33,10 @@ fn bench_emit_header(b: &mut Bencher) {
 // messages exceeding 512 bytes. A better benchmark would be to emit such a big message.
 #[bench]
 fn bench_parse_header_no_reservation(b: &mut Bencher) {
-    let header = Header::new(10, MessageType::Query, OpCode::Query);
+    let header = Header {
+        metadata: Metadata::new(10, MessageType::Query, OpCode::Query),
+        counts: HeaderCounts::default(),
+    };
     b.iter(|| {
         let mut bytes = Vec::with_capacity(0);
         let mut encoder = BinEncoder::new(&mut bytes);
@@ -49,14 +58,13 @@ fn bench_parse_header(b: &mut Bencher) {
 #[bench]
 fn bench_emit_message(b: &mut Bencher) {
     let mut message = Message::response(10, OpCode::Update);
-    message
-        .set_authoritative(true)
-        .set_truncated(true)
-        .set_recursion_desired(true)
-        .set_recursion_available(true)
-        .set_authentic_data(true)
-        .set_checking_disabled(true)
-        .set_response_code(ResponseCode::ServFail);
+    message.metadata.authoritative = true;
+    message.metadata.truncation = true;
+    message.metadata.recursion_desired = true;
+    message.metadata.recursion_available = true;
+    message.metadata.authentic_data = true;
+    message.metadata.checking_disabled = true;
+    message.metadata.response_code = ResponseCode::ServFail;
     message.add_answer(stub_record());
     message.add_authority(stub_record());
     message.add_additional(stub_record());
@@ -70,14 +78,13 @@ fn bench_emit_message(b: &mut Bencher) {
 #[bench]
 fn bench_emit_message_no_reservation(b: &mut Bencher) {
     let mut message = Message::response(10, OpCode::Update);
-    message
-        .set_authoritative(true)
-        .set_truncated(true)
-        .set_recursion_desired(true)
-        .set_recursion_available(true)
-        .set_authentic_data(true)
-        .set_checking_disabled(true)
-        .set_response_code(ResponseCode::ServFail);
+    message.metadata.authoritative = true;
+    message.metadata.truncation = true;
+    message.metadata.recursion_desired = true;
+    message.metadata.recursion_available = true;
+    message.metadata.authentic_data = true;
+    message.metadata.checking_disabled = true;
+    message.metadata.response_code = ResponseCode::ServFail;
     message.add_answer(stub_record());
     message.add_authority(stub_record());
     message.add_additional(stub_record());
@@ -89,16 +96,40 @@ fn bench_emit_message_no_reservation(b: &mut Bencher) {
 }
 
 #[bench]
+fn bench_emit_message_cve_2024_8508(b: &mut Bencher) {
+    let mut message = Message::response(10, OpCode::Update);
+    for i in 0..20 {
+        for j in 0..10 {
+            for k in 0..10 {
+                let record = Record::from_rdata(
+                    Name::parse(&format!("l{i}.l{j}.l{k}.example."), None).unwrap(),
+                    86400,
+                    RData::PTR(PTR(
+                        Name::parse(&format!("l{i}.l{j}.l{k}.test."), None).unwrap()
+                    )),
+                );
+                message.add_answer(record);
+            }
+        }
+    }
+    let mut buffer = Vec::with_capacity(u16::MAX as usize);
+    b.iter(|| {
+        let mut encoder = BinEncoder::new(&mut buffer);
+        message.emit(&mut encoder).unwrap();
+        buffer.clear();
+    })
+}
+
+#[bench]
 fn bench_parse_message(b: &mut Bencher) {
     let mut message = Message::response(10, OpCode::Update);
-    message
-        .set_authoritative(true)
-        .set_truncated(true)
-        .set_recursion_desired(true)
-        .set_recursion_available(true)
-        .set_authentic_data(true)
-        .set_checking_disabled(true)
-        .set_response_code(ResponseCode::ServFail);
+    message.metadata.authoritative = true;
+    message.metadata.truncation = true;
+    message.metadata.recursion_desired = true;
+    message.metadata.recursion_available = true;
+    message.metadata.authentic_data = true;
+    message.metadata.checking_disabled = true;
+    message.metadata.response_code = ResponseCode::ServFail;
 
     message.add_answer(stub_record());
     message.add_authority(stub_record());

@@ -124,11 +124,11 @@ struct Opts {
 fn print_record<D: RecordData, R: Deref<Target = Record<D>>>(r: &R) {
     println!(
         "\t{name} {ttl} {class} {ty} {rdata}",
-        name = style(r.name()).blue(),
-        ttl = style(r.ttl()).blue(),
-        class = style(r.dns_class()).blue(),
+        name = style(&r.name).blue(),
+        ttl = style(r.ttl).blue(),
+        class = style(r.dns_class).blue(),
         ty = style(r.record_type()).blue(),
-        rdata = r.data(),
+        rdata = r.data,
     );
 }
 
@@ -141,7 +141,7 @@ fn print_ok(lookup: Lookup) {
 
     let message = lookup.message();
 
-    let answers = message.answers();
+    let answers = &message.answers;
     if !answers.is_empty() {
         println!("\n;; {} SECTION:", style("ANSWER").yellow());
         for r in answers {
@@ -149,7 +149,7 @@ fn print_ok(lookup: Lookup) {
         }
     }
 
-    let authority = message.authorities();
+    let authority = &message.authorities;
     if !authority.is_empty() {
         println!("\n;; {} SECTION:", style("AUTHORITY").yellow());
         for r in authority {
@@ -157,7 +157,7 @@ fn print_ok(lookup: Lookup) {
         }
     }
 
-    let additional = message.additionals();
+    let additional = &message.additionals;
     if !additional.is_empty() {
         println!("\n;; {} SECTION:", style("ADDITIONAL").yellow());
         for r in additional {
@@ -291,7 +291,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let mut config = sys_config.unwrap_or_default();
+    let mut config = sys_config.unwrap_or_else(|| ResolverConfig::from_name_servers(vec![]));
 
     for ns in name_servers.iter() {
         config.add_name_server(ns.clone());

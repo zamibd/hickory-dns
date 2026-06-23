@@ -23,9 +23,14 @@
 //!   resource record in network byte order (high-order byte first).
 //! ```
 
-use core::net::AddrParseError;
+use alloc::string::ToString;
 pub use core::net::Ipv6Addr;
-use core::{fmt, ops::Deref, str};
+use core::{
+    fmt,
+    net::AddrParseError,
+    ops::Deref,
+    str::{self, FromStr},
+};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -33,7 +38,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordType},
-    serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder},
+    serialize::{
+        binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError},
+        txt::ParseError,
+    },
 };
 
 /// The DNS AAAA record type, an IPv6 address
@@ -46,6 +54,17 @@ impl AAAA {
     #[allow(clippy::too_many_arguments)]
     pub const fn new(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16, h: u16) -> Self {
         Self(Ipv6Addr::new(a, b, c, d, e, f, g, h))
+    }
+
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+    ) -> Result<Self, ParseError> {
+        let address: Ipv6Addr = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("ipv6 address".to_string()))
+            .and_then(|s| Ipv6Addr::from_str(s).map_err(Into::into))?;
+        Ok(address.into())
     }
 }
 
@@ -71,20 +90,20 @@ impl BinEncodable for AAAA {
         let segments = self.segments();
 
         // TODO: this might be more efficient as a single write of the array
-        encoder.emit_u16(segments[0])?;
-        encoder.emit_u16(segments[1])?;
-        encoder.emit_u16(segments[2])?;
-        encoder.emit_u16(segments[3])?;
-        encoder.emit_u16(segments[4])?;
-        encoder.emit_u16(segments[5])?;
-        encoder.emit_u16(segments[6])?;
-        encoder.emit_u16(segments[7])?;
+        segments[0].emit(encoder)?;
+        segments[1].emit(encoder)?;
+        segments[2].emit(encoder)?;
+        segments[3].emit(encoder)?;
+        segments[4].emit(encoder)?;
+        segments[5].emit(encoder)?;
+        segments[6].emit(encoder)?;
+        segments[7].emit(encoder)?;
         Ok(())
     }
 }
 
 impl<'r> BinDecodable<'r> for AAAA {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         // TODO: would this be more efficient as two u64 reads?
         let a: u16 = decoder.read_u16()?.unverified(/*valid as any u16*/);
         let b: u16 = decoder.read_u16()?.unverified(/*valid as any u16*/);
@@ -125,7 +144,7 @@ impl fmt::Display for AAAA {
     }
 }
 
-impl str::FromStr for AAAA {
+impl FromStr for AAAA {
     type Err = AddrParseError;
     fn from_str(s: &str) -> Result<Self, AddrParseError> {
         Ipv6Addr::from_str(s).map(From::from)

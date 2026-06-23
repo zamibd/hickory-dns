@@ -206,7 +206,7 @@ impl FromStr for RecordType {
     ///
     /// ```
     /// use std::str::FromStr;
-    /// use hickory_proto::rr::record_type::RecordType;
+    /// use hickory_proto::rr::RecordType;
     ///
     /// let var: RecordType = RecordType::from_str("A").unwrap();
     /// assert_eq!(RecordType::A, var);
@@ -259,7 +259,7 @@ impl From<u16> for RecordType {
     /// Convert from `u16` to `RecordType`
     ///
     /// ```
-    /// use hickory_proto::rr::record_type::RecordType;
+    /// use hickory_proto::rr::RecordType;
     ///
     /// let var = RecordType::from(1);
     /// assert_eq!(RecordType::A, var);
@@ -313,18 +313,18 @@ impl From<u16> for RecordType {
 
 impl BinEncodable for RecordType {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16((*self).into())
+        u16::from(*self).emit(encoder)
     }
 }
 
 impl BinDecodable<'_> for RecordType {
-    fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
-        Ok(decoder
+    fn read(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
+        decoder
             .read_u16()
             .map(
                 Restrict::unverified, /*RecordType is safe with any u16*/
             )
-            .map(Self::from)?)
+            .map(Self::from)
     }
 }
 
@@ -333,7 +333,7 @@ impl BinDecodable<'_> for RecordType {
 /// Convert from `RecordType` to `&str`
 ///
 /// ```
-/// use hickory_proto::rr::record_type::RecordType;
+/// use hickory_proto::rr::RecordType;
 ///
 /// let var: &'static str = From::from(RecordType::A);
 /// assert_eq!("A", var);
@@ -390,7 +390,7 @@ impl From<RecordType> for &'static str {
 /// Convert from `RecordType` to `u16`
 ///
 /// ```
-/// use hickory_proto::rr::record_type::RecordType;
+/// use hickory_proto::rr::RecordType;
 ///
 /// let var: u16 = RecordType::A.into();
 /// assert_eq!(1, var);

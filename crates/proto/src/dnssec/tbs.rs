@@ -66,9 +66,9 @@ impl TBS {
 
         // collect only the records for this rrset
         for record in records {
-            if dns_class == record.dns_class()
+            if dns_class == record.dns_class
                 && input.type_covered == record.record_type()
-                && name == record.name()
+                && name == &record.name
             {
                 rrset.push(record);
             }
@@ -84,10 +84,10 @@ impl TBS {
         let mut encoder = BinEncoder::new(&mut buf);
         // Encode records using DNSSEC canonical form. This affects how names inside RDATA are
         // encoded.
-        encoder.set_canonical_form(true);
+        encoder.canonical_form = true;
         // Disable name compression. Encoding of other fields may switch to use lowercase names
         // as well.
-        encoder.set_name_encoding(NameEncoding::Uncompressed);
+        encoder.name_encoding = NameEncoding::Uncompressed;
 
         //          signed_data = RRSIG_RDATA | RR(1) | RR(2)...  where
         //
@@ -116,13 +116,13 @@ impl TBS {
             dns_class.emit(&mut encoder)?;
             //
             //                OrigTTL is the value from the RRSIG Original TTL field
-            encoder.emit_u32(input.original_ttl)?;
+            input.original_ttl.emit(&mut encoder)?;
             //
             //                RDATA length
             let rdata_length_place = encoder.place::<u16>()?;
             //
             //                All names in the RDATA field are in canonical form (set above)
-            record.data().emit(&mut encoder)?;
+            record.data.emit(&mut encoder)?;
 
             let length = u16::try_from(encoder.len_since_place(&rdata_length_place))
                 .map_err(|_| ProtoError::from("RDATA length exceeds u16::MAX"))?;

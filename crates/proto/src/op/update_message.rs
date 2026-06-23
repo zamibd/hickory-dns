@@ -9,9 +9,10 @@
 
 use core::fmt::Debug;
 
+use super::{lower_query::LowerQuery, message_request::MessageRequest};
 #[cfg(any(feature = "std", feature = "no-std-rand"))]
 use crate::{
-    op::{Edns, OpCode},
+    op::{Edns, OpCode, edns::DEFAULT_MAX_PAYLOAD_LEN},
     rr::{DNSClass, Name, RData, RecordSet, RecordType, rdata::SOA},
 };
 use crate::{
@@ -75,7 +76,7 @@ pub trait UpdateMessage: Debug {
 ///   to properly do that.
 impl UpdateMessage for Message {
     fn id(&self) -> u16 {
-        self.id()
+        self.metadata.id
     }
 
     fn add_zone(&mut self, query: Query) {
@@ -111,19 +112,19 @@ impl UpdateMessage for Message {
     }
 
     fn zones(&self) -> &[Query] {
-        self.queries()
+        &self.queries
     }
 
     fn prerequisites(&self) -> &[Record] {
-        self.answers()
+        &self.answers
     }
 
     fn updates(&self) -> &[Record] {
-        self.authorities()
+        &self.authorities
     }
 
     fn additionals(&self) -> &[Record] {
-        self.additionals()
+        &self.additionals
     }
 
     fn signature(&self) -> Option<&Record<TSIG>> {
@@ -171,29 +172,28 @@ pub fn create(rrset: RecordSet, zone_origin: Name, use_edns: bool) -> Message {
     assert!(zone_origin.zone_of(rrset.name()));
 
     // for updates, the query section is used for the zone
-    let mut zone: Query = Query::new();
+    let mut zone: Query = Query::root();
     zone.set_name(zone_origin)
         .set_query_class(rrset.dns_class())
         .set_query_type(RecordType::SOA);
 
     // build the message
     let mut message = Message::query();
-    message
-        .set_op_code(OpCode::Update)
-        .set_recursion_desired(false);
+    message.metadata.op_code = OpCode::Update;
+    message.metadata.recursion_desired = false;
     message.add_zone(zone);
 
     let mut prerequisite = Record::update0(rrset.name().clone(), 0, rrset.record_type());
-    prerequisite.set_dns_class(DNSClass::NONE);
+    prerequisite.dns_class = DNSClass::NONE;
     message.add_pre_requisite(prerequisite.into_record_of_rdata());
     message.add_updates(rrset);
 
     // Extended dns
     if use_edns {
         message
-            .extensions_mut()
+            .edns
             .get_or_insert_with(Edns::new)
-            .set_max_payload(MAX_PAYLOAD_LEN)
+            .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
             .set_version(0);
     }
 
@@ -240,21 +240,20 @@ pub fn append(rrset: RecordSet, zone_origin: Name, must_exist: bool, use_edns: b
     assert!(zone_origin.zone_of(rrset.name()));
 
     // for updates, the query section is used for the zone
-    let mut zone: Query = Query::new();
+    let mut zone: Query = Query::root();
     zone.set_name(zone_origin)
         .set_query_class(rrset.dns_class())
         .set_query_type(RecordType::SOA);
 
     // build the message
     let mut message = Message::query();
-    message
-        .set_op_code(OpCode::Update)
-        .set_recursion_desired(false);
+    message.metadata.op_code = OpCode::Update;
+    message.metadata.recursion_desired = false;
     message.add_zone(zone);
 
     if must_exist {
         let mut prerequisite = Record::update0(rrset.name().clone(), 0, rrset.record_type());
-        prerequisite.set_dns_class(DNSClass::ANY);
+        prerequisite.dns_class = DNSClass::ANY;
         message.add_pre_requisite(prerequisite.into_record_of_rdata());
     }
 
@@ -263,9 +262,9 @@ pub fn append(rrset: RecordSet, zone_origin: Name, must_exist: bool, use_edns: b
     // Extended dns
     if use_edns {
         message
-            .extensions_mut()
+            .edns
             .get_or_insert_with(Edns::new)
-            .set_max_payload(MAX_PAYLOAD_LEN)
+            .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
             .set_version(0);
     }
 
@@ -325,16 +324,15 @@ pub fn compare_and_swap(
     assert!(zone_origin.zone_of(new.name()));
 
     // for updates, the query section is used for the zone
-    let mut zone: Query = Query::new();
+    let mut zone: Query = Query::root();
     zone.set_name(zone_origin)
         .set_query_class(new.dns_class())
         .set_query_type(RecordType::SOA);
 
     // build the message
     let mut message = Message::query();
-    message
-        .set_op_code(OpCode::Update)
-        .set_recursion_desired(false);
+    message.metadata.op_code = OpCode::Update;
+    message.metadata.recursion_desired = false;
     message.add_zone(zone);
 
     // make sure the record is what is expected
@@ -356,9 +354,9 @@ pub fn compare_and_swap(
     // Extended dns
     if use_edns {
         message
-            .extensions_mut()
+            .edns
             .get_or_insert_with(Edns::new)
-            .set_max_payload(MAX_PAYLOAD_LEN)
+            .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
             .set_version(0);
     }
 
@@ -394,16 +392,15 @@ pub fn delete_by_rdata(mut rrset: RecordSet, zone_origin: Name, use_edns: bool) 
     assert!(zone_origin.zone_of(rrset.name()));
 
     // for updates, the query section is used for the zone
-    let mut zone: Query = Query::new();
+    let mut zone: Query = Query::root();
     zone.set_name(zone_origin)
         .set_query_class(rrset.dns_class())
         .set_query_type(RecordType::SOA);
 
     // build the message
     let mut message = Message::query();
-    message
-        .set_op_code(OpCode::Update)
-        .set_recursion_desired(false);
+    message.metadata.op_code = OpCode::Update;
+    message.metadata.recursion_desired = false;
     message.add_zone(zone);
 
     // the class must be none to delete a record
@@ -415,9 +412,9 @@ pub fn delete_by_rdata(mut rrset: RecordSet, zone_origin: Name, use_edns: bool) 
     // Extended dns
     if use_edns {
         message
-            .extensions_mut()
-            .get_or_insert(Edns::new())
-            .set_max_payload(MAX_PAYLOAD_LEN)
+            .edns
+            .get_or_insert_with(Edns::new)
+            .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
             .set_version(0);
     }
 
@@ -449,35 +446,34 @@ pub fn delete_by_rdata(mut rrset: RecordSet, zone_origin: Name, use_edns: bool) 
 /// If no such RRset exists, then this Update RR will be silently ignored by the Primary Zone Server.
 #[cfg(any(feature = "std", feature = "no-std-rand"))]
 pub fn delete_rrset(mut record: Record, zone_origin: Name, use_edns: bool) -> Message {
-    assert!(zone_origin.zone_of(record.name()));
+    assert!(zone_origin.zone_of(&record.name));
 
     // for updates, the query section is used for the zone
-    let mut zone: Query = Query::new();
+    let mut zone: Query = Query::root();
     zone.set_name(zone_origin)
-        .set_query_class(record.dns_class())
+        .set_query_class(record.dns_class)
         .set_query_type(RecordType::SOA);
 
     // build the message
     let mut message = Message::query();
-    message
-        .set_op_code(OpCode::Update)
-        .set_recursion_desired(false);
+    message.metadata.op_code = OpCode::Update;
+    message.metadata.recursion_desired = false;
     message.add_zone(zone);
 
     // the class must be any to delete an rrset
-    record.set_dns_class(DNSClass::ANY);
+    record.dns_class = DNSClass::ANY;
     // the TTL should be 0
-    record.set_ttl(0);
+    record.ttl = 0;
     // the rdata must be null to delete an rrset
-    record.set_data(RData::Update0(record.record_type()));
+    record.data = RData::Update0(record.record_type());
     message.add_update(record);
 
     // Extended dns
     if use_edns {
         message
-            .extensions_mut()
+            .edns
             .get_or_insert_with(Edns::new)
-            .set_max_payload(MAX_PAYLOAD_LEN)
+            .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
             .set_version(0);
     }
 
@@ -519,16 +515,15 @@ pub fn delete_all(
     assert!(zone_origin.zone_of(&name_of_records));
 
     // for updates, the query section is used for the zone
-    let mut zone: Query = Query::new();
+    let mut zone: Query = Query::root();
     zone.set_name(zone_origin)
         .set_query_class(dns_class)
         .set_query_type(RecordType::SOA);
 
     // build the message
     let mut message = Message::query();
-    message
-        .set_op_code(OpCode::Update)
-        .set_recursion_desired(false);
+    message.metadata.op_code = OpCode::Update;
+    message.metadata.recursion_desired = false;
     message.add_zone(zone);
 
     // the TTL should be 0
@@ -537,16 +532,16 @@ pub fn delete_all(
     let mut record = Record::update0(name_of_records, 0, RecordType::ANY);
 
     // the class must be any to delete all rrsets
-    record.set_dns_class(DNSClass::ANY);
+    record.dns_class = DNSClass::ANY;
 
     message.add_update(record.into_record_of_rdata());
 
     // Extended dns
     if use_edns {
         message
-            .extensions_mut()
+            .edns
             .get_or_insert_with(Edns::new)
-            .set_max_payload(MAX_PAYLOAD_LEN)
+            .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
             .set_version(0);
     }
 
@@ -564,10 +559,10 @@ pub fn delete_all(
 #[cfg(any(feature = "std", feature = "no-std-rand"))]
 pub fn zone_transfer(zone_origin: Name, last_soa: Option<SOA>) -> Message {
     if let Some(soa) = &last_soa {
-        assert_eq!(&zone_origin, soa.mname());
+        assert_eq!(zone_origin, soa.mname);
     }
 
-    let mut zone: Query = Query::new();
+    let mut zone: Query = Query::root();
     zone.set_name(zone_origin).set_query_class(DNSClass::IN);
     if last_soa.is_some() {
         zone.set_query_type(RecordType::IXFR);
@@ -577,29 +572,71 @@ pub fn zone_transfer(zone_origin: Name, last_soa: Option<SOA>) -> Message {
 
     // build the message
     let mut message = Message::query();
-    message.set_recursion_desired(false);
+    message.metadata.recursion_desired = false;
     message.add_zone(zone);
 
     if let Some(soa) = last_soa {
         // for IXFR, old SOA is put as authority to indicate last known version
-        let record = Record::from_rdata(soa.mname().clone(), 0, RData::SOA(soa));
+        let record = Record::from_rdata(soa.mname.clone(), 0, RData::SOA(soa));
         message.add_authority(record);
     }
 
     // Extended dns
     {
         message
-            .extensions_mut()
+            .edns
             .get_or_insert_with(Edns::new)
-            .set_max_payload(MAX_PAYLOAD_LEN)
+            .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
             .set_version(0);
     }
 
     message
 }
 
-// TODO: this should be configurable
-// > An EDNS buffer size of 1232 bytes will avoid fragmentation on nearly all current networks.
-// https://dnsflagday.net/2020/
-/// Maximum payload length for EDNS update messages
-pub const MAX_PAYLOAD_LEN: u16 = 1232;
+/// A type which represents an MessageRequest for dynamic Update.
+pub trait UpdateRequest {
+    /// Id of the Message
+    fn id(&self) -> u16;
+
+    /// Zone being updated, this should be the query of a Message
+    fn zone(&self) -> &LowerQuery;
+
+    /// Prerequisites map to the Answer section of a Message
+    fn prerequisites(&self) -> &[Record];
+
+    /// Records to update map to the Authority section of a Message
+    fn updates(&self) -> &[Record];
+
+    /// Additional records
+    fn additionals(&self) -> &[Record];
+
+    /// Signature for verifying the Message
+    fn signature(&self) -> Option<&Record<TSIG>>;
+}
+
+impl UpdateRequest for MessageRequest {
+    fn id(&self) -> u16 {
+        self.metadata.id
+    }
+
+    fn zone(&self) -> &LowerQuery {
+        // RFC 2136 says "the Zone Section is allowed to contain exactly one record."
+        &self.queries
+    }
+
+    fn prerequisites(&self) -> &[Record] {
+        &self.answers
+    }
+
+    fn updates(&self) -> &[Record] {
+        &self.authorities
+    }
+
+    fn additionals(&self) -> &[Record] {
+        &self.additionals
+    }
+
+    fn signature(&self) -> Option<&Record<TSIG>> {
+        self.signature.as_deref()
+    }
+}

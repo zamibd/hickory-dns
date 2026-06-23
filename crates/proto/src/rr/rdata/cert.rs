@@ -7,18 +7,22 @@
 
 //! CERT record type for storing certificates in DNS
 use alloc::string::String;
-use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::fmt;
+use core::str::FromStr;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{ProtoError, ProtoResult},
+    error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{
-        BinDecodable, BinDecoder, BinEncodable, BinEncoder, RDataEncoding, Restrict, RestrictedMath,
+    serialize::{
+        binary::{
+            BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, RDataEncoding,
+            Restrict, RestrictedMath,
+        },
+        txt::ParseError,
     },
 };
 
@@ -143,7 +147,7 @@ impl From<CertType> for u16 {
 }
 
 impl<'r> BinDecodable<'r> for CertType {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let algorithm_id = decoder
             .read_u16()?
             .unverified(/*CertType is verified as safe in processing this*/);
@@ -366,7 +370,7 @@ impl From<Algorithm> for u8 {
 
 impl<'r> BinDecodable<'r> for Algorithm {
     // https://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let algorithm_id = decoder
             .read_u8()?
             .unverified(/*Algorithm is verified as safe in processing this*/);
@@ -401,11 +405,22 @@ impl fmt::Display for Algorithm {
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct CERT {
-    cert_type: CertType,
-    key_tag: u16,
-    algorithm: Algorithm,
-    cert_data: Vec<u8>,
+    /// The CERT type
+    pub cert_type: CertType,
+
+    /// The CERT key tag
+    pub key_tag: u16,
+
+    /// The CERT algorithm
+    pub algorithm: Algorithm,
+
+    /// The CERT record data
+    ///
+    /// The data stored here is **not** base64-encoded. Use the `cert_base64()` function
+    /// if you need the data in base64-encoded format.
+    pub cert_data: Vec<u8>,
 }
 
 impl CERT {
@@ -424,24 +439,43 @@ impl CERT {
         }
     }
 
-    /// Returns the CERT type
-    pub fn cert_type(&self) -> CertType {
-        self.cert_type
-    }
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        tokens: I,
+    ) -> Result<Self, ParseError> {
+        let mut iter = tokens;
 
-    /// Returns the CERT key tag
-    pub fn key_tag(&self) -> u16 {
-        self.key_tag
-    }
+        let token = iter
+            .next()
+            .ok_or(ParseError::Message("CERT cert type field missing"))?;
+        let cert_type = CertType::from(
+            u16::from_str(token)
+                .map_err(|_| ParseError::Message("Invalid digit found in cert_type token"))?,
+        );
 
-    /// Returns the CERT algorithm
-    pub fn algorithm(&self) -> Algorithm {
-        self.algorithm
-    }
+        let token = iter
+            .next()
+            .ok_or(ParseError::Message("CERT key tag field missing"))?;
+        let key_tag = u16::from_str(token)
+            .map_err(|_| ParseError::Message("Invalid digit found in key_tag token"))?;
 
-    /// Returns the CERT record data
-    pub fn cert_data(&self) -> Vec<u8> {
-        self.cert_data.clone()
+        let token = iter
+            .next()
+            .ok_or(ParseError::Message("CERT algorithm field missing"))?;
+        let algorithm = Algorithm::from(
+            u8::from_str(token)
+                .map_err(|_| ParseError::Message("Invalid digit found in algorithm token"))?,
+        );
+
+        let token = iter
+            .next()
+            .ok_or(ParseError::Message("CERT data missing"))?;
+
+        let cert_data = data_encoding::BASE64
+            .decode(token.as_bytes())
+            .map_err(|_| ParseError::Message("Invalid base64 CERT data"))?;
+
+        Ok(Self::new(cert_type, key_tag, algorithm, cert_data))
     }
 
     /// Returns the CERT (Base64)
@@ -451,7 +485,7 @@ impl CERT {
 }
 
 impl TryFrom<&[u8]> for CERT {
-    type Error = ProtoError;
+    type Error = DecodeError;
 
     fn try_from(cert_record: &[u8]) -> Result<Self, Self::Error> {
         let mut decoder = BinDecoder::new(cert_record);
@@ -463,21 +497,24 @@ impl TryFrom<&[u8]> for CERT {
 impl BinEncodable for CERT {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         let mut encoder = encoder.with_rdata_behavior(RDataEncoding::Other);
-        encoder.emit_u16(self.cert_type.into())?;
-        encoder.emit_u16(self.key_tag)?;
-        encoder.emit_u8(self.algorithm.into())?;
-        encoder.emit_vec(&self.cert_data)?;
+        u16::from(self.cert_type).emit(&mut encoder)?;
+        self.key_tag.emit(&mut encoder)?;
+        u8::from(self.algorithm).emit(&mut encoder)?;
+        encoder.emit_slice(&self.cert_data)?;
 
         Ok(())
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for CERT {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         let rdata_length = length.map(|u| u as usize).unverified(/*used only as length safely*/);
 
         if rdata_length <= 5 {
-            return Err(ProtoError::from("invalid cert_record length".to_string()));
+            return Err(DecodeError::IncorrectRDataLengthRead {
+                read: rdata_length,
+                len: 6,
+            });
         }
 
         let start_idx = decoder.index();
@@ -490,7 +527,7 @@ impl<'r> RecordDataDecodable<'r> for CERT {
         let cert_len = length
             .map(|u| u as usize)
             .checked_sub(decoder.index() - start_idx)
-            .map_err(|_| ProtoError::from("invalid rdata length in CERT"))?
+            .map_err(|len| DecodeError::IncorrectRDataLengthRead { read: decoder.index() - start_idx, len })?
             .unverified(/*used only as length safely*/);
 
         let cert_data = decoder.read_vec(cert_len)?.unverified(/*will fail in usage if invalid*/);
@@ -754,12 +791,66 @@ mod tests {
 
         let result = CERT::try_from(&invalid_cert_record[..]);
         assert!(
-            result.is_err(),
-            "Expected error due to invalid cert_record length"
+            matches!(
+                result,
+                Err(DecodeError::IncorrectRDataLengthRead { read: 4, len: 6 })
+            ),
+            "Expected error due to invalid cert_record length, got {result:?}"
         );
+    }
 
-        if let Err(e) = result {
-            assert_eq!(e.to_string(), "invalid cert_record length".to_string());
-        }
+    #[test]
+    fn test_valid_cert_data() {
+        // Base64-encoded dummy certificate data.
+        let tokens = vec!["1", "123", "3", "Q2VydGlmaWNhdGUgZGF0YQ=="].into_iter();
+
+        let result = CERT::from_tokens(tokens);
+
+        assert!(result.is_ok());
+
+        let cert = result.unwrap();
+        assert_eq!(cert.cert_type, CertType::from(1));
+        assert_eq!(cert.key_tag, 123);
+        assert_eq!(cert.algorithm, Algorithm::from(3));
+        assert_eq!(cert.cert_data, b"Certificate data".to_vec()); // Decoded base64 data.
+    }
+
+    #[test]
+    fn test_invalid_base64_data() {
+        // Invalid base64 data (contains invalid characters).
+        let tokens = vec!["1", "123", "3", "Invalid_base64"].into_iter();
+
+        let result = CERT::from_tokens(tokens);
+
+        // Expecting an error for invalid base64 data.
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(format!("{err}"), "Invalid base64 CERT data");
+    }
+
+    #[test]
+    fn test_invalid_token_digit() {
+        // Missing cert_type (first token) will try to decode cert leading to invalid digit
+        let tokens = vec!["123", "3", "Q2VydGlmaWNhdGUgZGF0YQ=="].into_iter();
+
+        let result = CERT::from_tokens(tokens);
+
+        // Expecting an error due to missing cert type.
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(format!("{err}"), "Invalid digit found in algorithm token");
+    }
+
+    #[test]
+    fn test_missing_cert_data() {
+        // Missing cert_data (last token)
+        let tokens = vec!["1", "123", "3"].into_iter();
+
+        let result = CERT::from_tokens(tokens);
+
+        // Expecting an error due to missing cert data.
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(format!("{err}"), "CERT data missing");
     }
 }

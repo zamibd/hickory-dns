@@ -35,7 +35,8 @@ impl RecordTypeSet {
         }
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = RecordType> + '_ {
+    /// Returns an iterator over all types in this record type set.
+    pub fn iter(&self) -> impl Iterator<Item = RecordType> + '_ {
         self.types.iter().copied()
     }
 
@@ -77,7 +78,7 @@ impl fmt::Debug for RecordTypeSet {
 impl BinEncodable for RecordTypeSet {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         if let Some(encoded_bytes) = &self.original_encoding {
-            return encoder.emit_vec(encoded_bytes);
+            return encoder.emit_slice(encoded_bytes);
         }
 
         let mut hash: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
@@ -103,11 +104,11 @@ impl BinEncodable for RecordTypeSet {
 
         // output bitmaps
         for (window, bitmap) in hash {
-            encoder.emit(window)?;
+            window.emit(encoder)?;
             // the hashset should never be larger that 255 based on above logic.
-            encoder.emit(bitmap.len() as u8)?;
+            (bitmap.len() as u8).emit(encoder)?;
             for bits in bitmap {
-                encoder.emit(bits)?;
+                bits.emit(encoder)?;
             }
         }
 
@@ -116,7 +117,7 @@ impl BinEncodable for RecordTypeSet {
 }
 
 impl RecordDataDecodable<'_> for RecordTypeSet {
-    fn read_data(decoder: &mut BinDecoder<'_>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'_>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         // 3.2.1.  Type Bit Maps Encoding
         //
         //  The encoding of the Type Bit Maps field is the same as that used by
@@ -193,7 +194,7 @@ impl RecordDataDecodable<'_> for RecordTypeSet {
                             .checked_sub(left.unverified(/*will fail as param in this call if invalid*/))
                             .checked_mul(8)
                             .checked_add(i)
-                            .map_err(|_| "block len or left out of bounds in NSEC(3)")?
+                            .map_err(|_| DecodeError::NsecBitmapOutOfBounds)?
                             .unverified(/*any u8 is valid at this point*/);
                             let rr_type: u16 = (u16::from(window) << 8) | u16::from(low_byte);
                             types.insert(RecordType::from(rr_type));
@@ -205,7 +206,7 @@ impl RecordDataDecodable<'_> for RecordTypeSet {
                     // move to the next section of the bit_map
                     let left = left
                         .checked_sub(1)
-                        .map_err(|_| ProtoError::from("block left out of bounds in NSEC(3)"))?;
+                        .map_err(|_| DecodeError::NsecBitmapOutOfBounds)?;
                     if left.unverified(/*comparison is safe*/) == 0 {
                         // we've exhausted this Window, move to the next
                         BitMapReadState::Window

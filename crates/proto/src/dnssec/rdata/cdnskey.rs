@@ -14,7 +14,6 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ProtoError,
     dnssec::{Algorithm, PublicKeyBuf},
     error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
@@ -132,20 +131,20 @@ impl From<CDNSKEY> for RData {
 
 impl BinEncodable for CDNSKEY {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16(self.flags())?;
-        encoder.emit(3)?;
+        self.flags().emit(encoder)?;
+        3u8.emit(encoder)?;
         match self.algorithm() {
             Some(algorithm) => algorithm.emit(encoder)?,
-            None => encoder.emit_u8(0)?,
+            None => 0u8.emit(encoder)?,
         }
-        encoder.emit_vec(&self.public_key)?;
+        encoder.emit_slice(&self.public_key)?;
 
         Ok(())
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for CDNSKEY {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         let flags = decoder.read_u16()?.unverified(/* used as a bitfield, this is safe */);
 
         // protocol is defined to only be '3' right now
@@ -166,7 +165,7 @@ impl<'r> RecordDataDecodable<'r> for CDNSKEY {
         let key_len = length
             .map(|u| u as usize)
             .checked_sub(4)
-            .map_err(|_| ProtoError::from("invalid rdata length in DNSKEY"))?
+            .map_err(|len| DecodeError::IncorrectRDataLengthRead { read: 4, len })?
             .unverified(/* used only as length safely */);
         let public_key = decoder
             .read_vec(key_len)?

@@ -7,39 +7,45 @@
 
 //! Resource record related components, e.g. `Name` aka label, `Record`, `RData`, ...
 
-pub mod dns_class;
-// TODO: rename to sec
-pub mod domain;
-mod lower_name;
-pub mod rdata;
-pub mod record_data;
-pub mod record_type;
-pub(crate) mod record_type_set;
-pub mod resource;
-mod rr_key;
-mod rr_set;
-pub mod serial_number;
-mod tsig;
-
 use core::fmt::{Debug, Display};
 
-use crate::{
-    error::ProtoResult,
-    serialize::binary::{BinDecodable, BinDecoder, BinEncodable, Restrict},
-};
+use crate::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, DecodeError, Restrict};
 
-pub use self::dns_class::DNSClass;
-pub use self::domain::{IntoName, Name};
-pub use self::record_data::RData;
-pub use self::record_type::RecordType;
-pub use self::record_type_set::RecordTypeSet;
-pub use self::resource::Record;
-#[cfg(feature = "__dnssec")]
-pub use self::rr_set::RecordsAndRrsigsIter;
-pub use self::rr_set::{RecordSet, RecordSetParts, RrsetRecords};
+pub(crate) mod dns_class;
+pub use dns_class::DNSClass;
+
+pub mod domain;
+pub use domain::{IntoName, Label, Name};
+
+mod lower_name;
 pub use lower_name::LowerName;
+
+pub mod rdata;
+
+pub(crate) mod record;
+pub use record::{Record, RecordRef};
+
+pub(crate) mod record_data;
+pub use record_data::RData;
+
+pub(crate) mod record_type;
+pub use record_type::RecordType;
+
+pub(crate) mod record_type_set;
+pub use record_type_set::RecordTypeSet;
+
+mod rr_key;
 pub use rr_key::RrKey;
+
+mod rr_set;
+#[cfg(feature = "__dnssec")]
+pub use rr_set::RecordsAndRrsigsIter;
+pub use rr_set::{RecordSet, RrsetRecords};
+
+pub(crate) mod serial_number;
 pub use serial_number::SerialNumber;
+
+mod tsig;
 #[cfg(feature = "__dnssec")]
 pub use tsig::TSigVerifier;
 pub use tsig::{TSigResponseContext, TSigner};
@@ -69,14 +75,17 @@ pub(crate) trait RecordDataDecodable<'r>: Sized {
     /// * `decoder` - data stream from which the RData will be read
     /// * `record_type` - specifies the RecordType that has already been read from the stream
     /// * `length` - the data length that should be read from the stream for this RecordData
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self>;
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError>;
 }
 
 impl<'r, T> RecordDataDecodable<'r> for T
 where
     T: 'r + BinDecodable<'r> + Sized,
 {
-    fn read_data(decoder: &mut BinDecoder<'r>, _length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(
+        decoder: &mut BinDecoder<'r>,
+        _length: Restrict<u16>,
+    ) -> Result<Self, DecodeError> {
         T::read(decoder)
     }
 }

@@ -14,7 +14,7 @@ use hickory_net::runtime::{Time, TokioRuntimeProvider, TokioTime};
 use hickory_net::xfer::Protocol;
 #[cfg(feature = "__dnssec")]
 use hickory_proto::op::{Edns, LowerQuery, Message};
-use hickory_proto::op::{Header, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::op::{MessageRequest, MessageType, Metadata, OpCode, Query, ResponseCode};
 #[cfg(feature = "__dnssec")]
 use hickory_proto::rr::TSigner;
 #[cfg(feature = "__dnssec")]
@@ -32,12 +32,10 @@ use hickory_server::store::in_memory::InMemoryZoneHandler;
 use hickory_server::store::sqlite::{Journal, SqliteZoneHandler};
 #[cfg(feature = "__dnssec")]
 use hickory_server::zone_handler::MessageResponseBuilder;
-use hickory_server::zone_handler::{
-    AxfrPolicy, LookupError, LookupOptions, MessageRequest, ZoneHandler, ZoneType,
-};
+use hickory_server::zone_handler::{AxfrPolicy, LookupError, LookupOptions, ZoneHandler, ZoneType};
 use test_support::subscribe;
 
-const TEST_HEADER: &Header = &Header::new(10, MessageType::Query, OpCode::Query);
+const TEST_METADATA: &Metadata = &Metadata::new(10, MessageType::Query, OpCode::Query);
 
 fn create_example() -> SqliteZoneHandler {
     let mut handler = hickory_integration::example_zone::create_example();
@@ -58,10 +56,10 @@ async fn test_search() {
     let example = create_example();
     let origin = example.origin().clone();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(origin.into());
     let request = Request::from_message(
-        MessageRequest::mock(*TEST_HEADER, query),
+        MessageRequest::mock(*TEST_METADATA, query),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
     )
@@ -75,8 +73,8 @@ async fn test_search() {
     if !result.is_empty() {
         let record = result.iter().next().unwrap();
         assert_eq!(record.record_type(), RecordType::A);
-        assert_eq!(record.dns_class(), DNSClass::IN);
-        assert_eq!(record.data(), &RData::A(A::new(93, 184, 215, 14)));
+        assert_eq!(record.dns_class, DNSClass::IN);
+        assert_eq!(record.data, RData::A(A::new(93, 184, 215, 14)));
     } else {
         panic!("expected a result"); // valid panic, in test
     }
@@ -89,10 +87,10 @@ async fn test_search_www() {
     let example = create_example();
     let www_name = Name::parse("www.example.com.", None).unwrap();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(www_name);
     let request = Request::from_message(
-        MessageRequest::mock(*TEST_HEADER, query),
+        MessageRequest::mock(*TEST_METADATA, query),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
     )
@@ -106,8 +104,8 @@ async fn test_search_www() {
     if !result.is_empty() {
         let record = result.iter().next().unwrap();
         assert_eq!(record.record_type(), RecordType::A);
-        assert_eq!(record.dns_class(), DNSClass::IN);
-        assert_eq!(record.data(), &RData::A(A::new(93, 184, 215, 14)));
+        assert_eq!(record.dns_class, DNSClass::IN);
+        assert_eq!(record.data, RData::A(A::new(93, 184, 215, 14)));
     } else {
         panic!("expected a result"); // valid panic, in test
     }
@@ -132,7 +130,7 @@ async fn test_zone_handler() {
             .iter()
             .next()
             .unwrap()
-            .dns_class(),
+            .dns_class,
         DNSClass::IN
     );
 
@@ -170,8 +168,6 @@ async fn test_zone_handler() {
             86400,
             RData::NS(NS(Name::parse("a.iana-servers.net.", None).unwrap())),
         )
-        .set_dns_class(DNSClass::IN)
-        .clone()
     );
     assert_eq!(
         *lookup.last().unwrap(),
@@ -180,8 +176,6 @@ async fn test_zone_handler() {
             86400,
             RData::NS(NS(Name::parse("b.iana-servers.net.", None).unwrap())),
         )
-        .set_dns_class(DNSClass::IN)
-        .clone()
     );
 
     assert!(
@@ -222,8 +216,6 @@ async fn test_zone_handler() {
                     .to_string(),
             ])),
         )
-        .set_dns_class(DNSClass::IN)
-        .clone()
     );
 
     assert_eq!(
@@ -244,8 +236,6 @@ async fn test_zone_handler() {
             86400,
             RData::A(A::new(93, 184, 215, 14)),
         )
-        .set_dns_class(DNSClass::IN)
-        .clone()
     );
 }
 
@@ -259,8 +249,8 @@ async fn test_authorize_update() {
     let handler = create_example();
 
     let mut message = Message::query();
-    message.set_op_code(OpCode::Update);
-    message.add_query(Query::default());
+    message.metadata.op_code = OpCode::Update;
+    message.add_query(Query::root());
 
     let bytes = message.to_bytes().unwrap();
     let request =
@@ -287,110 +277,58 @@ async fn test_prerequisites() {
     // first check the initial negatives, ttl = 0, and the zone is the same
     assert_eq!(
         handler
-            .verify_prerequisites(&[Record::update0(not_in_zone.clone(), 86400, RecordType::A)
-                .set_dns_class(DNSClass::IN)
-                .clone()],)
+            .verify_prerequisites(&[Record::update0(not_in_zone.clone(), 86400, RecordType::A)],)
             .await,
         Err(ResponseCode::FormErr)
     );
     assert_eq!(
         handler
-            .verify_prerequisites(&[Record::update0(not_zone, 0, RecordType::A)
-                .set_dns_class(DNSClass::IN)
-                .clone()],)
+            .verify_prerequisites(&[Record::update0(not_zone, 0, RecordType::A)],)
             .await,
         Err(ResponseCode::NotZone)
     );
 
     // *   ANY      ANY      empty    Name is in use
-    assert!(
-        handler
-            .verify_prerequisites(&[Record::update0(
-                handler.origin().clone().into(),
-                0,
-                RecordType::ANY,
-            )
-            .set_dns_class(DNSClass::ANY)
-            .clone()])
-            .await
-            .is_ok()
-    );
+    let mut record = Record::update0(handler.origin().clone().into(), 0, RecordType::ANY);
+    record.dns_class = DNSClass::ANY;
+    assert!(handler.verify_prerequisites(&[record]).await.is_ok());
+    let mut record = Record::from_rdata(not_in_zone.clone(), 0, RData::Update0(RecordType::ANY));
+    record.dns_class = DNSClass::ANY;
     assert_eq!(
-        handler
-            .verify_prerequisites(&[Record::from_rdata(
-                not_in_zone.clone(),
-                0,
-                RData::Update0(RecordType::ANY)
-            )
-            .set_dns_class(DNSClass::ANY)
-            .clone()],)
-            .await,
+        handler.verify_prerequisites(&[record],).await,
         Err(ResponseCode::NXDomain)
     );
 
     // *   ANY      rrset    empty    RRset exists (value independent)
-    assert!(
-        handler
-            .verify_prerequisites(&[Record::update0(
-                handler.origin().clone().into(),
-                0,
-                RecordType::A,
-            )
-            .set_dns_class(DNSClass::ANY)
-            .clone()])
-            .await
-            .is_ok()
-    );
+    let mut record = Record::update0(handler.origin().clone().into(), 0, RecordType::A);
+    record.dns_class = DNSClass::ANY;
+    assert!(handler.verify_prerequisites(&[record]).await.is_ok());
+    let mut record = Record::update0(not_in_zone.clone(), 0, RecordType::A);
+    record.dns_class = DNSClass::ANY;
     assert_eq!(
-        handler
-            .verify_prerequisites(&[Record::update0(not_in_zone.clone(), 0, RecordType::A,)
-                .set_dns_class(DNSClass::ANY)
-                .clone()],)
-            .await,
+        handler.verify_prerequisites(&[record]).await,
         Err(ResponseCode::NXRRSet)
     );
 
     // *   NONE     ANY      empty    Name is not in use
-    assert!(
-        handler
-            .verify_prerequisites(&[Record::update0(not_in_zone.clone(), 0, RecordType::ANY,)
-                .set_dns_class(DNSClass::NONE)
-                .clone()])
-            .await
-            .is_ok()
-    );
+    let mut record = Record::update0(not_in_zone.clone(), 0, RecordType::ANY);
+    record.dns_class = DNSClass::NONE;
+    assert!(handler.verify_prerequisites(&[record]).await.is_ok());
+    let mut record = Record::update0(handler.origin().clone().into(), 0, RecordType::ANY);
+    record.dns_class = DNSClass::NONE;
     assert_eq!(
-        handler
-            .verify_prerequisites(&[Record::update0(
-                handler.origin().clone().into(),
-                0,
-                RecordType::ANY,
-            )
-            .set_dns_class(DNSClass::NONE)
-            .clone()],)
-            .await,
+        handler.verify_prerequisites(&[record],).await,
         Err(ResponseCode::YXDomain)
     );
 
     // *   NONE     rrset    empty    RRset does not exist
-    assert!(
-        handler
-            .verify_prerequisites(&[Record::update0(not_in_zone.clone(), 0, RecordType::A,)
-                .set_dns_class(DNSClass::NONE)
-                .clone()])
-            .await
-            .is_ok()
-    );
+    let mut record = Record::update0(not_in_zone.clone(), 0, RecordType::A);
+    record.dns_class = DNSClass::NONE;
+    assert!(handler.verify_prerequisites(&[record]).await.is_ok());
+    let mut record = Record::update0(handler.origin().clone().into(), 0, RecordType::A);
+    record.dns_class = DNSClass::NONE;
     assert_eq!(
-        handler
-            .verify_prerequisites(&[Record::update0(
-                handler.origin().clone().into(),
-                0,
-                RecordType::A,
-            )
-            .set_dns_class(DNSClass::NONE)
-            .clone()],)
-            .await,
+        handler.verify_prerequisites(&[record]).await,
         Err(ResponseCode::YXRRSet)
     );
 
@@ -401,23 +339,19 @@ async fn test_prerequisites() {
                 handler.origin().clone().into(),
                 0,
                 RData::A(A::new(93, 184, 215, 14)),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone()])
+            )])
             .await
             .is_ok()
     );
     // wrong class
+    let mut record = Record::from_rdata(
+        handler.origin().clone().into(),
+        0,
+        RData::A(A::new(93, 184, 215, 14)),
+    );
+    record.dns_class = DNSClass::CH;
     assert_eq!(
-        handler
-            .verify_prerequisites(&[Record::from_rdata(
-                handler.origin().clone().into(),
-                0,
-                RData::A(A::new(93, 184, 215, 14)),
-            )
-            .set_dns_class(DNSClass::CH)
-            .clone()],)
-            .await,
+        handler.verify_prerequisites(&[record]).await,
         Err(ResponseCode::FormErr)
     );
     // wrong Name
@@ -427,9 +361,7 @@ async fn test_prerequisites() {
                 not_in_zone,
                 0,
                 RData::A(A::new(93, 184, 216, 24)),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone()],)
+            )],)
             .await,
         Err(ResponseCode::NXRRSet)
     );
@@ -440,9 +372,7 @@ async fn test_prerequisites() {
                 handler.origin().clone().into(),
                 0,
                 RData::A(A::new(93, 184, 216, 24)),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone()],)
+            )],)
             .await,
         Err(ResponseCode::NXRRSet)
     );
@@ -459,36 +389,30 @@ async fn test_pre_scan() {
 
     assert_eq!(
         handler
-            .pre_scan(&[
-                Record::from_rdata(not_zone, 86400, RData::A(A::new(93, 184, 216, 24)),)
-                    .set_dns_class(DNSClass::IN)
-                    .clone()
-            ],)
+            .pre_scan(&[Record::from_rdata(
+                not_zone,
+                86400,
+                RData::A(A::new(93, 184, 216, 24)),
+            )],)
             .await,
         Err(ResponseCode::NotZone)
     );
 
     assert_eq!(
         handler
-            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::ANY,)
-                .set_dns_class(DNSClass::IN)
-                .clone()],)
+            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::ANY)])
             .await,
         Err(ResponseCode::FormErr)
     );
     assert_eq!(
         handler
-            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::AXFR,)
-                .set_dns_class(DNSClass::IN)
-                .clone()],)
+            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::AXFR)])
             .await,
         Err(ResponseCode::FormErr)
     );
     assert_eq!(
         handler
-            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::IXFR,)
-                .set_dns_class(DNSClass::IN)
-                .clone()],)
+            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::IXFR)])
             .await,
         Err(ResponseCode::FormErr)
     );
@@ -498,133 +422,74 @@ async fn test_pre_scan() {
                 up_name.clone(),
                 86400,
                 RData::A(A::new(93, 184, 216, 24)),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone()])
+            )])
             .await
             .is_ok()
     );
     assert!(
         handler
-            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::A,)
-                .set_dns_class(DNSClass::IN)
-                .clone()])
+            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::A)])
             .await
             .is_ok()
     );
 
+    let mut record = Record::from_rdata(up_name.clone(), 86400, RData::A(A::new(93, 184, 216, 24)));
+    record.dns_class = DNSClass::ANY;
     assert_eq!(
-        handler
-            .pre_scan(&[Record::from_rdata(
-                up_name.clone(),
-                86400,
-                RData::A(A::new(93, 184, 216, 24)),
-            )
-            .set_dns_class(DNSClass::ANY)
-            .clone()],)
-            .await,
+        handler.pre_scan(&[record]).await,
         Err(ResponseCode::FormErr)
     );
+
+    let mut record = Record::from_rdata(up_name.clone(), 0, RData::A(A::new(93, 184, 216, 24)));
+    record.dns_class = DNSClass::ANY;
     assert_eq!(
-        handler
-            .pre_scan(&[
-                Record::from_rdata(up_name.clone(), 0, RData::A(A::new(93, 184, 216, 24)),)
-                    .set_dns_class(DNSClass::ANY)
-                    .clone()
-            ],)
-            .await,
+        handler.pre_scan(&[record]).await,
         Err(ResponseCode::FormErr)
     );
+
+    let mut record = Record::update0(up_name.clone(), 0, RecordType::AXFR);
+    record.dns_class = DNSClass::ANY;
     assert_eq!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::AXFR,)
-                .set_dns_class(DNSClass::ANY)
-                .clone()],)
-            .await,
-        Err(ResponseCode::FormErr)
+        handler.pre_scan(&[record]).await,
+        Err(ResponseCode::FormErr),
     );
+    let mut record = Record::update0(up_name.clone(), 0, RecordType::IXFR);
+    record.dns_class = DNSClass::ANY;
     assert_eq!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::IXFR,)
-                .set_dns_class(DNSClass::ANY)
-                .clone()],)
-            .await,
-        Err(ResponseCode::FormErr)
+        handler.pre_scan(&[record]).await,
+        Err(ResponseCode::FormErr),
     );
+    let mut record = Record::update0(up_name.clone(), 0, RecordType::ANY);
+    record.dns_class = DNSClass::ANY;
+    assert!(handler.pre_scan(&[record]).await.is_ok());
+    let mut record = Record::update0(up_name.clone(), 0, RecordType::A);
+    record.dns_class = DNSClass::ANY;
+    assert!(handler.pre_scan(&[record]).await.is_ok());
+
+    for ty in [RecordType::ANY, RecordType::AXFR, RecordType::IXFR] {
+        let mut record = Record::update0(up_name.clone(), 0, ty);
+        record.dns_class = DNSClass::NONE;
+        assert_eq!(
+            handler.pre_scan(&[record]).await,
+            Err(ResponseCode::FormErr)
+        );
+    }
+
     assert!(
         handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::ANY,)
-                .set_dns_class(DNSClass::ANY)
-                .clone()])
-            .await
-            .is_ok()
-    );
-    assert!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::A,)
-                .set_dns_class(DNSClass::ANY)
-                .clone()])
+            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::A)])
             .await
             .is_ok()
     );
 
-    assert_eq!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 86400, RecordType::A,)
-                .set_dns_class(DNSClass::NONE)
-                .clone()],)
-            .await,
-        Err(ResponseCode::FormErr)
-    );
-    assert_eq!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::ANY,)
-                .set_dns_class(DNSClass::NONE)
-                .clone()],)
-            .await,
-        Err(ResponseCode::FormErr)
-    );
-    assert_eq!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::AXFR,)
-                .set_dns_class(DNSClass::NONE)
-                .clone()],)
-            .await,
-        Err(ResponseCode::FormErr)
-    );
-    assert_eq!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::IXFR,)
-                .set_dns_class(DNSClass::NONE)
-                .clone()],)
-            .await,
-        Err(ResponseCode::FormErr)
-    );
-    assert!(
-        handler
-            .pre_scan(&[Record::update0(up_name.clone(), 0, RecordType::A,)
-                .set_dns_class(DNSClass::NONE)
-                .clone()])
-            .await
-            .is_ok()
-    );
-    assert!(
-        handler
-            .pre_scan(&[
-                Record::from_rdata(up_name.clone(), 0, RData::A(A::new(93, 184, 216, 24)),)
-                    .set_dns_class(DNSClass::NONE)
-                    .clone()
-            ])
-            .await
-            .is_ok()
-    );
+    let mut record = Record::from_rdata(up_name.clone(), 0, RData::A(A::new(93, 184, 216, 24)));
+    record.dns_class = DNSClass::NONE;
+    assert!(handler.pre_scan(&[record]).await.is_ok());
 
+    let mut record = Record::update0(up_name, 86400, RecordType::A);
+    record.dns_class = DNSClass::CH;
     assert_eq!(
-        handler
-            .pre_scan(&[Record::update0(up_name, 86400, RecordType::A,)
-                .set_dns_class(DNSClass::CH)
-                .clone()],)
-            .await,
+        handler.pre_scan(&[record]).await,
         Err(ResponseCode::FormErr)
     );
 }
@@ -645,28 +510,22 @@ async fn test_update() {
             www_name.clone(),
             86400,
             RData::TXT(TXT::new(vec!["v=spf1 -all".to_string()])),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
-        Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(93, 184, 215, 14)))
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+        ),
+        Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(93, 184, 215, 14))),
         Record::from_rdata(
             www_name.clone(),
             86400,
             RData::AAAA(AAAA::new(
                 0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
     ];
 
     original_vec.sort();
 
     let message_request = MessageRequest::mock(
-        Header::new(0, MessageType::Query, OpCode::Query),
-        Query::query(origin_name, RecordType::AXFR),
+        Metadata::new(0, MessageType::Query, OpCode::Query),
+        Query::new(origin_name, RecordType::AXFR),
     );
     let request = Request::from_message(
         message_request,
@@ -688,7 +547,7 @@ async fn test_update() {
             .0
             .unwrap()
             .iter()
-            .filter(|record| record.name() == &www_name)
+            .filter(|record| record.name == www_name)
             .cloned()
             .collect::<Vec<_>>();
         www_records.sort();
@@ -708,18 +567,17 @@ async fn test_update() {
                 .0
                 .unwrap()
                 .iter()
-                .any(|record| record.name() == &new_name)
+                .any(|record| record.name == new_name)
         );
     }
 
     //
     //  zone     rrset    rr       Add to an RRset
-    let add_record =
-        &[
-            Record::from_rdata(new_name.clone(), 86400, RData::A(A::new(93, 184, 216, 24)))
-                .set_dns_class(DNSClass::IN)
-                .clone(),
-        ];
+    let add_record = &[Record::from_rdata(
+        new_name.clone(),
+        86400,
+        RData::A(A::new(93, 184, 216, 24)),
+    )];
     assert!(
         handler
             .update_records(add_record, true,)
@@ -738,18 +596,17 @@ async fn test_update() {
             .0
             .unwrap()
             .iter()
-            .filter(|record| record.name() == &new_name)
+            .filter(|record| record.name == new_name)
             .collect::<Vec<_>>(),
         add_record.iter().collect::<Vec<_>>()
     );
     assert_eq!(serial + 1, handler.serial().await);
 
-    let add_www_record =
-        &[
-            Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(10, 0, 0, 1)))
-                .set_dns_class(DNSClass::IN)
-                .clone(),
-        ];
+    let add_www_record = &[Record::from_rdata(
+        www_name.clone(),
+        86400,
+        RData::A(A::new(10, 0, 0, 1)),
+    )];
     assert!(
         handler
             .update_records(add_www_record, true,)
@@ -770,7 +627,7 @@ async fn test_update() {
             .0
             .unwrap()
             .iter()
-            .filter(|record| record.name() == &www_name)
+            .filter(|record| record.name == www_name)
             .cloned()
             .collect::<Vec<_>>();
         www_records.sort();
@@ -783,15 +640,13 @@ async fn test_update() {
 
     //
     //  NONE     rrset    rr       Delete an RR from an RRset
-    let del_record =
-        &[
-            Record::from_rdata(new_name.clone(), 86400, RData::A(A::new(93, 184, 216, 24)))
-                .set_dns_class(DNSClass::NONE)
-                .clone(),
-        ];
+    let mut del_record =
+        Record::from_rdata(new_name.clone(), 86400, RData::A(A::new(93, 184, 216, 24)));
+    del_record.dns_class = DNSClass::NONE;
+
     assert!(
         handler
-            .update_records(del_record, true,)
+            .update_records(&[del_record], true)
             .await
             .expect("update failed",)
     );
@@ -808,7 +663,7 @@ async fn test_update() {
             .0
             .unwrap()
             .iter()
-            .filter(|record| record.name() == &new_name)
+            .filter(|record| record.name == new_name)
             .cloned()
             .collect::<Vec<_>>();
 
@@ -817,14 +672,11 @@ async fn test_update() {
     }
 
     // remove one from www
-    let del_record = &[
-        Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(10, 0, 0, 1)))
-            .set_dns_class(DNSClass::NONE)
-            .clone(),
-    ];
+    let mut del_record = Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(10, 0, 0, 1)));
+    del_record.dns_class = DNSClass::NONE;
     assert!(
         handler
-            .update_records(del_record, true,)
+            .update_records(&[del_record], true)
             .await
             .expect("update failed",)
     );
@@ -841,7 +693,7 @@ async fn test_update() {
             .0
             .unwrap()
             .iter()
-            .filter(|record| record.name() == &www_name)
+            .filter(|record| record.name == www_name)
             .cloned()
             .collect::<Vec<_>>();
         www_records.sort();
@@ -851,12 +703,11 @@ async fn test_update() {
 
     //
     //  ANY      rrset    empty    Delete an RRset
-    let del_record = &[Record::update0(www_name.clone(), 86400, RecordType::A)
-        .set_dns_class(DNSClass::ANY)
-        .clone()];
+    let mut del_record = Record::update0(www_name.clone(), 86400, RecordType::A);
+    del_record.dns_class = DNSClass::ANY;
     assert!(
         handler
-            .update_records(del_record, true,)
+            .update_records(&[del_record], true)
             .await
             .expect("update failed",)
     );
@@ -866,18 +717,14 @@ async fn test_update() {
             www_name.clone(),
             86400,
             RData::TXT(TXT::new(vec!["v=spf1 -all".to_string()])),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         Record::from_rdata(
             www_name.clone(),
             86400,
             RData::AAAA(AAAA::new(
                 0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
     ];
     removed_a_vec.sort();
 
@@ -893,7 +740,7 @@ async fn test_update() {
             .0
             .unwrap()
             .iter()
-            .filter(|record| record.name() == &www_name)
+            .filter(|record| record.name == www_name)
             .cloned()
             .collect::<Vec<_>>();
         www_records.sort();
@@ -904,13 +751,12 @@ async fn test_update() {
     //
     //  ANY      ANY      empty    Delete all RRsets from a name
     println!("deleting all records");
-    let del_record = &[Record::update0(www_name.clone(), 86400, RecordType::ANY)
-        .set_dns_class(DNSClass::ANY)
-        .clone()];
+    let mut del_record = Record::update0(www_name.clone(), 86400, RecordType::ANY);
+    del_record.dns_class = DNSClass::ANY;
 
     assert!(
         handler
-            .update_records(del_record, true,)
+            .update_records(&[del_record], true,)
             .await
             .expect("update failed",)
     );
@@ -927,7 +773,7 @@ async fn test_update() {
             .0
             .unwrap()
             .iter()
-            .any(|record| record.name() == &www_name)
+            .any(|record| record.name == www_name)
     );
 
     assert_eq!(serial + 6, handler.serial().await);
@@ -950,8 +796,8 @@ async fn test_update_tsig_valid() {
     let new_name = Name::from_str("new.example.com.").unwrap();
     let origin_name = Name::from_str("example.com.").unwrap();
     let message_request = MessageRequest::mock(
-        Header::new(0, MessageType::Query, OpCode::Query),
-        Query::query(origin_name, RecordType::AXFR),
+        Metadata::new(0, MessageType::Query, OpCode::Query),
+        Query::new(origin_name, RecordType::AXFR),
     );
     let request = Request::from_message(
         message_request,
@@ -971,7 +817,7 @@ async fn test_update_tsig_valid() {
             .0
             .unwrap()
             .iter()
-            .any(|record| record.name() == &new_name)
+            .any(|record| record.name == new_name)
     );
 
     // Now we construct an update message to add a new A record for the name.
@@ -984,7 +830,7 @@ async fn test_update_tsig_valid() {
         .unwrap();
     let (sig, _) = signer.sign_message(&message, now).unwrap();
     // Save the MAC of the request so we can verify the response.
-    let request_mac = sig.data().mac().to_vec();
+    let request_mac = sig.data.mac.clone();
     message.set_signature(sig);
 
     // TODO(@cpu): add and use a MessageRequestBuilder type?
@@ -1008,17 +854,19 @@ async fn test_update_tsig_valid() {
     edns.options_mut().insert(EdnsOption::NSID(
         NSIDPayload::new([0xC0, 0xFF, 0xEE]).unwrap(),
     ));
-    let response = MessageResponseBuilder::new(request.raw_queries(), Some(&edns));
-    let mut response_header = Header::new(request.id(), MessageType::Response, OpCode::Update);
-    response_header.set_response_code(ResponseCode::NoError);
+    let response = MessageResponseBuilder::new(&request.queries, Some(&edns));
+    let mut response_header =
+        Metadata::new(request.metadata.id, MessageType::Response, OpCode::Update);
+    response_header.response_code = ResponseCode::NoError;
     let mut response = response.build_no_records(response_header);
 
     // Serialize the unsigned response to get the TBS bytes to sign with the signer.
     let mut tbs_response_buf = Vec::with_capacity(512);
     let mut encoder = BinEncoder::new(&mut tbs_response_buf);
-    let mut response_header = Header::new(request.id(), MessageType::Response, OpCode::Update);
-    response_header.set_response_code(ResponseCode::NoError);
-    let tbs_response = MessageResponseBuilder::new(request.raw_queries(), Some(&edns))
+    let mut response_header =
+        Metadata::new(request.metadata.id, MessageType::Response, OpCode::Update);
+    response_header.response_code = ResponseCode::NoError;
+    let tbs_response = MessageResponseBuilder::new(&request.queries, Some(&edns))
         .build_no_records(response_header);
     tbs_response.destructive_emit(&mut encoder).unwrap();
 
@@ -1050,13 +898,13 @@ async fn test_update_tsig_valid() {
         .0
         .unwrap()
         .iter()
-        .filter(|record| record.name() == &new_name)
+        .filter(|record| record.name == new_name)
         .cloned()
         .collect::<Vec<_>>();
 
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].name(), &new_name);
-    let RData::A(a) = records[0].data() else {
+    assert_eq!(records[0].name, new_name);
+    let RData::A(a) = records[0].data else {
         panic!("unexpected record data");
     };
     assert_eq!(a.0, IpAddr::from([192, 168, 1, 10]));
@@ -1102,12 +950,12 @@ async fn test_update_tsig_invalid_unknown_signer() {
     let resp_signer = resp_signer.expect("missing expected response signer");
     // We don't need to pass in a response here - it's not used for this error case.
     let tsig_rr = resp_signer.sign(&[]).unwrap();
-    let tsig_rr = tsig_rr.data();
+    let tsig_rr = tsig_rr.data;
 
     // The TSIG RR should be unsigned.
-    assert_eq!(tsig_rr.mac(), &[]);
+    assert_eq!(tsig_rr.mac, &[]);
     // The TSIG RR should have the expected TSIG error RCODE.
-    assert_eq!(tsig_rr.error(), &Some(TsigError::BadKey));
+    assert_eq!(tsig_rr.error, Some(TsigError::BadKey));
 }
 
 #[cfg(feature = "__dnssec")]
@@ -1155,12 +1003,12 @@ async fn test_update_tsig_invalid_sig() {
     let resp_signer = resp_signer.expect("missing expected response signer");
     // We don't need to pass in a response here - it's not used for this error case.
     let tsig_rr = resp_signer.sign(&[]).unwrap();
-    let tsig_rr = tsig_rr.data();
+    let tsig_rr = tsig_rr.data;
 
     // The TSIG RR should be unsigned.
-    assert_eq!(tsig_rr.mac(), &[]);
+    assert_eq!(tsig_rr.mac, &[]);
     // The TSIG RR should have the expected TSIG error RCODE.
-    assert_eq!(tsig_rr.error(), &Some(TsigError::BadSig));
+    assert_eq!(tsig_rr.error, Some(TsigError::BadSig));
 }
 
 #[cfg(feature = "__dnssec")]
@@ -1185,7 +1033,7 @@ async fn test_update_tsig_invalid_stale_sig() {
     let too_stale = now - (signer.fudge() as u64) - 1;
     let (sig, _) = signer.sign_message(&message, too_stale).unwrap();
     // Save the MAC of the request so we can verify the response.
-    let request_mac = sig.data().mac().to_vec();
+    let request_mac = sig.data.mac.clone();
     message.set_signature(sig);
 
     // TODO(@cpu): add and use a MessageRequestBuilder type?
@@ -1204,23 +1052,25 @@ async fn test_update_tsig_invalid_stale_sig() {
     // Build an initial unsigned response for the update.
     // The catalog handles this in normal operation, but we're testing at the level of the
     // SqliteZoneHandler and so have to do this ourselves.
-    let response = MessageResponseBuilder::new(request.raw_queries(), None);
-    let mut response_header = Header::new(request.id(), MessageType::Response, OpCode::Update);
-    response_header.set_response_code(ResponseCode::NotAuth);
+    let response = MessageResponseBuilder::new(&request.queries, None);
+    let mut response_header =
+        Metadata::new(request.metadata.id, MessageType::Response, OpCode::Update);
+    response_header.response_code = ResponseCode::NotAuth;
     let mut response = response.build_no_records(response_header);
 
     // Serialize the unsigned response to get the TBS bytes to sign with the signer.
     let mut tbs_response_buf = Vec::with_capacity(512);
     let mut encoder = BinEncoder::new(&mut tbs_response_buf);
-    let mut response_header = Header::new(request.id(), MessageType::Response, OpCode::Update);
-    response_header.set_response_code(ResponseCode::NotAuth);
+    let mut response_header =
+        Metadata::new(request.metadata.id, MessageType::Response, OpCode::Update);
+    response_header.response_code = ResponseCode::NotAuth;
     let tbs_response =
-        MessageResponseBuilder::new(request.raw_queries(), None).build_no_records(response_header);
+        MessageResponseBuilder::new(&request.queries, None).build_no_records(response_header);
     tbs_response.destructive_emit(&mut encoder).unwrap();
 
     // Update the response with the produced signature.
     let resp_sig = resp_signer.sign(&tbs_response_buf).unwrap();
-    let error = *resp_sig.data().error();
+    let error = resp_sig.data.error;
     response.set_signature(resp_sig);
 
     // Serialize the now-signed response.
@@ -1254,19 +1104,15 @@ fn test_tsig_signer(key_name: Name) -> TSigner {
 
 #[cfg(feature = "__dnssec")]
 fn test_update_message(name: Name) -> Message {
-    let mut q = Query::default();
+    let mut q = Query::root();
     q.set_name(name.clone());
     q.set_query_class(DNSClass::IN);
     q.set_query_type(RecordType::SOA);
 
-    let mut add_rec = Record::from_rdata(name, 3600, RData::A(A::new(192, 168, 1, 10)));
-    add_rec.set_dns_class(DNSClass::IN);
-
+    let add_rec = Record::from_rdata(name, 3600, RData::A(A::new(192, 168, 1, 10)));
     let mut message = Message::query();
-    message
-        .set_op_code(OpCode::Update)
-        .add_query(q)
-        .add_authority(add_rec);
+    message.metadata.op_code = OpCode::Update;
+    message.add_query(q).add_authority(add_rec);
     message
 }
 
@@ -1281,8 +1127,8 @@ async fn test_zone_signing() {
     let handler = create_secure_example();
 
     let message_request = MessageRequest::mock(
-        Header::new(0, MessageType::Query, OpCode::Query),
-        Query::query(handler.origin().clone().into(), RecordType::AXFR),
+        Metadata::new(0, MessageType::Query, OpCode::Query),
+        Query::new(handler.origin().clone().into(), RecordType::AXFR),
     );
     let request = Request::from_message(
         message_request,
@@ -1321,9 +1167,7 @@ async fn test_zone_signing() {
                 .iter()
                 .filter_map(|r| {
                     match r.record_type() {
-                        RecordType::RRSIG if r.name() == record.name() => {
-                            RRSIG::try_borrow(r.data())
-                        }
+                        RecordType::RRSIG if r.name == record.name => RRSIG::try_borrow(&r.data),
                         _ => None,
                     }
                 })
@@ -1348,7 +1192,7 @@ async fn test_get_nsec() {
         .unwrap();
 
     for record in &results {
-        assert!(*record.name() < name);
+        assert!(record.name < name);
     }
 }
 
@@ -1368,10 +1212,9 @@ async fn test_journal() {
     let delete_name = Name::from_str("www.example.com.").unwrap();
     let new_record =
         Record::from_rdata(new_name.clone(), 0, RData::A(A::new(10, 11, 12, 13))).clone();
-    let delete_record =
-        Record::from_rdata(delete_name.clone(), 0, RData::A(A::new(93, 184, 215, 14)))
-            .set_dns_class(DNSClass::NONE)
-            .clone();
+    let mut delete_record =
+        Record::from_rdata(delete_name.clone(), 0, RData::A(A::new(93, 184, 215, 14)));
+    delete_record.dns_class = DNSClass::NONE;
     handler
         .update_records(&[new_record.clone(), delete_record], true)
         .await
@@ -1521,7 +1364,7 @@ async fn test_recovery() {
             .records_without_rrsigs()
             .zip(other_rr_set.records_without_rrsigs())
             .all(|(record, other_record)| {
-                record.ttl() == other_record.ttl() && record.data() == other_record.data()
+                record.ttl == other_record.ttl && record.data == other_record.data
             })
     },));
 
@@ -1533,7 +1376,7 @@ async fn test_recovery() {
             .records_without_rrsigs()
             .zip(other_rr_set.records_without_rrsigs())
             .all(|(record, other_record)| {
-                record.ttl() == other_record.ttl() && record.data() == other_record.data()
+                record.ttl == other_record.ttl && record.data == other_record.data
             })
     }));
 }
@@ -1546,8 +1389,8 @@ async fn test_axfr_allow_all() {
 
     let request = Request::from_message(
         MessageRequest::mock(
-            *TEST_HEADER,
-            Query::query(Name::from_str("example.com.").unwrap(), RecordType::AXFR),
+            *TEST_METADATA,
+            Query::new(Name::from_str("example.com.").unwrap(), RecordType::AXFR),
         ),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
@@ -1577,8 +1420,8 @@ async fn test_axfr_deny_all() {
 
     let request = Request::from_message(
         MessageRequest::mock(
-            *TEST_HEADER,
-            Query::query(Name::from_str("example.com.").unwrap(), RecordType::AXFR),
+            *TEST_METADATA,
+            Query::new(Name::from_str("example.com.").unwrap(), RecordType::AXFR),
         ),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
@@ -1609,12 +1452,12 @@ async fn test_axfr_deny_unsigned() {
     let mut handler = create_example();
     handler.set_axfr_policy(AxfrPolicy::AllowSigned);
 
-    let query = LowerQuery::from(Query::query(
+    let query = LowerQuery::from(Query::new(
         Name::from_str("example.com.").unwrap(),
         RecordType::AXFR,
     ));
     let request = Request::from_message(
-        MessageRequest::mock(*TEST_HEADER, query),
+        MessageRequest::mock(*TEST_METADATA, query),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
     )
@@ -1648,7 +1491,7 @@ async fn test_axfr_allow_tsig_signed() {
     handler.set_axfr_policy(AxfrPolicy::AllowSigned);
     handler.set_tsig_signers(vec![signer.clone()]);
 
-    let query = Query::query(Name::from_str("example.com.").unwrap(), RecordType::AXFR);
+    let query = Query::new(Name::from_str("example.com.").unwrap(), RecordType::AXFR);
     let mut message = Message::query();
     message.add_query(query);
 

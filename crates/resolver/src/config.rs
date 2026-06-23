@@ -23,6 +23,7 @@ use std::{fs, io};
 use ipnet::IpNet;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 #[cfg(all(
     feature = "toml",
     feature = "serde",
@@ -38,13 +39,14 @@ use tracing::{debug, info};
 use crate::name_server_pool::NameServerTransportState;
 #[cfg(any(feature = "__https", feature = "__h3"))]
 use crate::net::http::DEFAULT_DNS_QUERY_PATH;
-use crate::net::xfer::Protocol;
+use crate::net::xfer::{CONNECT_TIMEOUT, Protocol};
 use crate::proto::access_control::{AccessControlSet, AccessControlSetBuilder};
+use crate::proto::op::DEFAULT_MAX_PAYLOAD_LEN;
 use crate::proto::rr::Name;
 
 /// Configuration for the upstream nameservers to use for resolution
 #[non_exhaustive]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ResolverConfig {
     /// Base search domain
@@ -139,6 +141,13 @@ impl ResolverConfig {
             search,
             name_servers,
         }
+    }
+
+    /// Create a ResolverConfig from a list of name server configurations.
+    ///
+    /// No base domain for relative names will be set, and no additional search domains will be set.
+    pub fn from_name_servers(name_servers: Vec<NameServerConfig>) -> Self {
+        Self::from_parts(None, vec![], name_servers)
     }
 
     /// Take the `domain`, `search`, and `name_servers` from the config.
@@ -548,6 +557,15 @@ pub struct ResolverOpts {
     /// to a number of servers in parallel. Defaults to 2; 0 or 1 will execute requests serially.
     #[cfg_attr(feature = "serde", serde(default = "default_num_concurrent_reqs"))]
     pub num_concurrent_reqs: usize,
+    /// Maximum number of active (in-flight) requests per multiplexed connection.
+    ///
+    /// This limits how many DNS queries can be simultaneously pending on a single
+    /// connection to an upstream nameserver. When the limit is reached, new requests
+    /// will return a busy error.
+    ///
+    /// Defaults to 32. Higher values allow more parallelism but consume more memory.
+    #[cfg_attr(feature = "serde", serde(default = "default_max_active_requests"))]
+    pub max_active_requests: usize,
     /// Preserve all intermediate records in the lookup response, such as CNAME records
     #[cfg_attr(feature = "serde", serde(default = "default_preserve_intermediates"))]
     pub preserve_intermediates: bool,
@@ -590,20 +608,32 @@ pub struct ResolverOpts {
     pub allow_answers: Vec<IpNet>,
     /// Networks listed here will be removed from any answers returned by an upstream server.
     pub deny_answers: Vec<IpNet>,
+    /// Configure the EDNS UDP payload size used in queries.
+    ///
+    /// See [DnsRequestOptions::edns_payload_len][crate::proto::op::DnsRequestOptions::edns_payload_len].
+    #[cfg_attr(feature = "serde", serde(default = "default_edns_payload_len"))]
+    pub edns_payload_len: u16,
+    /// Per-connection timeout for TCP/TLS/QUIC connect attempts.
+    ///
+    /// This controls how long a single connection attempt (TCP SYN + TLS/QUIC handshake) is
+    /// allowed to take before being abandoned, allowing the pool to move on to the next server.
+    /// Defaults to 2s.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "default_connect_timeout", with = "duration")
+    )]
+    pub connect_timeout: Duration,
 }
 
 impl ResolverOpts {
-    pub(crate) fn answer_address_filter(&self) -> Option<AccessControlSet> {
-        if self.deny_answers.is_empty() {
-            return None;
-        }
-
-        Some(
-            AccessControlSetBuilder::new("resolver_answer_filter")
-                .allow(self.allow_answers.iter())
-                .deny(self.deny_answers.iter())
-                .build(),
-        )
+    pub(crate) fn answer_address_filter(&self) -> AccessControlSet {
+        let name = "resolver_answer_filter";
+        AccessControlSetBuilder::new(name)
+            .allow(self.allow_answers.iter())
+            .deny(self.deny_answers.iter())
+            .build()
+            .inspect_err(|err| warn!("{err}"))
+            .unwrap_or_else(|_| AccessControlSet::empty(name))
     }
 }
 
@@ -616,7 +646,7 @@ impl Default for ResolverOpts {
             ndots: default_ndots(),
             timeout: default_timeout(),
             attempts: default_attempts(),
-            edns0: false,
+            edns0: true,
             #[cfg(feature = "__dnssec")]
             validate: false,
             ip_strategy: LookupIpStrategy::default(),
@@ -627,6 +657,7 @@ impl Default for ResolverOpts {
             positive_max_ttl: None,
             negative_max_ttl: None,
             num_concurrent_reqs: default_num_concurrent_reqs(),
+            max_active_requests: default_max_active_requests(),
 
             // Defaults to `true` to match the behavior of dig and nslookup.
             preserve_intermediates: default_preserve_intermediates(),
@@ -640,6 +671,8 @@ impl Default for ResolverOpts {
             trust_anchor: None,
             allow_answers: vec![],
             deny_answers: vec![],
+            edns_payload_len: default_edns_payload_len(),
+            connect_timeout: default_connect_timeout(),
         }
     }
 }
@@ -652,16 +685,24 @@ fn default_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
+fn default_connect_timeout() -> Duration {
+    CONNECT_TIMEOUT
+}
+
 fn default_attempts() -> usize {
     2
 }
 
 fn default_cache_size() -> u64 {
-    32
+    8_192
 }
 
 fn default_num_concurrent_reqs() -> usize {
     2
+}
+
+fn default_max_active_requests() -> usize {
+    32
 }
 
 fn default_preserve_intermediates() -> bool {
@@ -672,6 +713,10 @@ fn default_recursion_desired() -> bool {
     true
 }
 
+fn default_edns_payload_len() -> u16 {
+    DEFAULT_MAX_PAYLOAD_LEN
+}
+
 /// The lookup ip strategy
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -680,12 +725,14 @@ pub enum LookupIpStrategy {
     Ipv4Only,
     /// Only query for AAAA (Ipv6) records
     Ipv6Only,
-    /// Query for A and AAAA in parallel
-    #[default]
+    /// Query for A and AAAA in parallel, ordering A before AAAA
     Ipv4AndIpv6,
+    /// Query for AAAA and A in parallel, ordering AAAA before A (default)
+    #[default]
+    Ipv6AndIpv4,
     /// Query for Ipv6 if that fails, query for Ipv4
     Ipv6thenIpv4,
-    /// Query for Ipv4 if that fails, query for Ipv6 (default)
+    /// Query for Ipv4 if that fails, query for Ipv6
     Ipv4thenIpv6,
 }
 
@@ -925,7 +972,7 @@ pub const QUAD9: ServerGroup<'static> = ServerGroup {
         IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
         IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
         IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
-        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0x00fe, 0x0009)),
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)),
     ],
     server_name: "dns.quad9.net",
     path: "/dns-query",
@@ -1117,5 +1164,6 @@ mod tests {
         assert_eq!(code.os_port_selection, json.os_port_selection);
         assert_eq!(code.case_randomization, json.case_randomization);
         assert_eq!(code.trust_anchor, json.trust_anchor);
+        assert_eq!(code.connect_timeout, json.connect_timeout);
     }
 }

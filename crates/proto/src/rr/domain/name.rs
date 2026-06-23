@@ -7,7 +7,6 @@
 
 //! domain name, aka labels, implementation
 
-#[cfg(feature = "serde")]
 use alloc::string::ToString;
 use alloc::{string::String, vec::Vec};
 use core::char;
@@ -28,6 +27,7 @@ use crate::rr::domain::usage::LOCALHOST as LOCALHOST_usage;
 use crate::serialize::binary::{
     BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, NameEncoding, Restrict,
 };
+use crate::serialize::txt::ParseError;
 
 /// A domain name
 #[derive(Clone, Default, Eq)]
@@ -373,31 +373,7 @@ impl Name {
 
     /// same as `zone_of` allows for case sensitive call
     pub fn zone_of_case(&self, name: &Self) -> bool {
-        let self_len = self.label_ends.len();
-        let name_len = name.label_ends.len();
-        if self_len == 0 {
-            return true;
-        }
-        if name_len == 0 {
-            // self_len != 0
-            return false;
-        }
-        if self_len > name_len {
-            return false;
-        }
-
-        let self_iter = self.iter().rev();
-        let name_iter = name.iter().rev();
-
-        let zip_iter = self_iter.zip(name_iter);
-
-        for (self_label, name_label) in zip_iter {
-            if self_label != name_label {
-                return false;
-            }
-        }
-
-        true
+        self.zone_of_with(name, <[u8]>::eq)
     }
 
     /// returns true if the name components of self are all present at the end of name
@@ -416,10 +392,23 @@ impl Name {
     /// assert!(!another.zone_of(&name));
     /// ```
     pub fn zone_of(&self, name: &Self) -> bool {
-        let self_lower = self.to_lowercase();
-        let name_lower = name.to_lowercase();
+        self.zone_of_with(name, <[u8]>::eq_ignore_ascii_case)
+    }
 
-        self_lower.zone_of_case(&name_lower)
+    fn zone_of_with(&self, name: &Self, label_eq: fn(&[u8], &[u8]) -> bool) -> bool {
+        let self_len = self.label_ends.len();
+        let name_len = name.label_ends.len();
+        match (self_len, name_len) {
+            (0, _) => return true,
+            (_, 0) => return false,
+            _ if self_len > name_len => return false,
+            _ => {}
+        }
+
+        self.iter()
+            .rev()
+            .zip(name.iter().rev())
+            .all(|(a, b)| label_eq(a, b))
     }
 
     /// Returns the number of labels in the name, discounting `*`.
@@ -486,6 +475,18 @@ impl Name {
     /// 1, this is never the case so the method returns false.
     pub fn is_empty(&self) -> bool {
         false
+    }
+
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+        origin: Option<&Self>,
+    ) -> Result<Self, ParseError> {
+        let name = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("name".to_string()))
+            .and_then(|s| Self::parse(s, origin).map_err(ParseError::from))?;
+        Ok(name)
     }
 
     /// attempts to parse a name such as `"example.com."` or `"subdomain.example.com."`
@@ -673,23 +674,19 @@ impl Name {
 
     /// Compare two Names, not considering FQDN-ness.
     fn cmp_labels<F: LabelCmp>(&self, other: &Self) -> Ordering {
-        if self.label_ends.is_empty() && other.label_ends.is_empty() {
-            return Ordering::Equal;
-        }
-
-        // we reverse the iters so that we are comparing from the root/domain to the local...
-        let self_labels = self.iter().rev();
-        let other_labels = other.iter().rev();
-
-        for (l, r) in self_labels.zip(other_labels) {
-            let l = Label::from_raw_bytes(l).unwrap();
-            let r = Label::from_raw_bytes(r).unwrap();
-            match l.cmp_with_f::<F>(&r) {
-                Ordering::Equal => continue,
-                not_eq => return not_eq,
+        // Compare from root to local (reversed)
+        for (l, r) in self.iter().rev().zip(other.iter().rev()) {
+            for (&a, &b) in l.iter().zip(r.iter()) {
+                match F::cmp_u8(a, b) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
+            }
+            match l.len().cmp(&r.len()) {
+                Ordering::Equal => {}
+                ord => return ord,
             }
         }
-
         self.label_ends.len().cmp(&other.label_ends.len())
     }
 
@@ -1130,14 +1127,10 @@ impl PartialEq<Self> for Name {
 impl Hash for Name {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.is_fqdn.hash(state);
-
-        // this needs to be CaseInsensitive like PartialEq
-        for l in self
-            .iter()
-            .map(|l| Label::from_raw_bytes(l).unwrap().to_lowercase())
-        {
-            l.hash(state);
-        }
+        // Note: case-insensitive like `PartialEq`
+        self.iter()
+            .flatten()
+            .for_each(|&b| state.write_u8(b.to_ascii_lowercase()));
     }
 }
 
@@ -1151,13 +1144,14 @@ enum ParseState {
 impl BinEncodable for Name {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         let name;
-        let name_ref = if matches!(encoder.name_encoding(), NameEncoding::UncompressedLowercase) {
+        let name_ref = if matches!(encoder.name_encoding, NameEncoding::UncompressedLowercase) {
             name = self.to_lowercase();
             &name
         } else {
             self
         };
-        let compression = matches!(encoder.name_encoding(), NameEncoding::Compressed);
+        let compression = matches!(encoder.name_encoding, NameEncoding::Compressed)
+            && encoder.compressed_name_count < COMPRESSED_NAME_LIMIT;
 
         let buf_len = encoder.len(); // lazily assert the size is less than 255...
         // lookup the label in the BinEncoder
@@ -1173,38 +1167,45 @@ impl BinEncodable for Name {
                 return Err(DecodeError::LabelBytesTooLong(label.len()).into());
             }
 
-            labels_written.push(encoder.offset());
+            labels_written.push(encoder.offset);
             encoder.emit_character_data(label)?;
         }
-        let last_index = encoder.offset();
+        let last_index = encoder.offset;
         // now search for other labels already stored matching from the beginning label, strip then to the end
         //   if it's not found, then store this as a new label
-        for label_idx in &labels_written {
-            match encoder.get_label_pointer(*label_idx, last_index) {
-                // if writing canonical and already found, continue
-                Some(_) if !compression => continue,
-                Some(loc) if compression && loc & 0xC000 == 0 => {
-                    // reset back to the beginning of this label, and then write the pointer...
-                    encoder.set_offset(*label_idx);
-                    encoder.trim();
+        if compression {
+            encoder.compressed_name_count += 1;
+            for label_idx in &labels_written {
+                match encoder.get_label_pointer(*label_idx, last_index) {
+                    Some(loc) if loc & 0xC000 == 0 => {
+                        // reset back to the beginning of this label, and then write the pointer...
+                        encoder.offset = *label_idx;
+                        encoder.trim();
 
-                    // write out the pointer marker
-                    //  or'd with the location which is less than 2^14
-                    encoder.emit_u16(0xC000u16 | loc)?;
+                        // write out the pointer marker
+                        //  or'd with the location which is less than 2^14
+                        (0xC000u16 | loc).emit(encoder)?;
 
-                    // we found a pointer don't write more, break
-                    return Ok(());
+                        // we found a pointer don't write more, break
+                        return Ok(());
+                    }
+                    _ => {
+                        // no existing label exists, store this new one.
+                        encoder.store_label_pointer(*label_idx, last_index);
+                    }
                 }
-                _ => {
-                    // no existing label exists, store this new one.
-                    encoder.store_label_pointer(*label_idx, last_index);
-                }
+            }
+        } else {
+            // Compression is disabled for either this name or the entire message. Just attempt to
+            // store the label pointers, in case they'll be used by an eligible RData type later.
+            for label_idx in &labels_written {
+                encoder.store_label_pointer(*label_idx, last_index);
             }
         }
 
         // if we're getting here, then we didn't write out a pointer and are ending the name
         // the end of the list of names
-        encoder.emit(0)?;
+        0u8.emit(encoder)?;
 
         // the entire name needs to be less than 256.
         let length = encoder.len() - buf_len;
@@ -1216,25 +1217,29 @@ impl BinEncodable for Name {
     }
 }
 
+/// Maximum number of names for which name compression will be attempted per message.
+///
+/// This limit matches that from Unbound, see
+/// <https://nlnetlabs.nl/downloads/unbound/patch_CVE-2024-8508.diff>.
+const COMPRESSED_NAME_LIMIT: usize = 120;
+
 impl<'r> BinDecodable<'r> for Name {
-    /// parses the chain of labels
-    ///  this has a max of 255 octets, with each label being less than 63.
-    ///  all names will be stored lowercase internally.
-    /// This will consume the portions of the `Vec` which it is reading...
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    /// Parses a domain name.
+    ///
+    /// The maximum length of a name is 255 octets, and the maximum length of each label is 63.
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let mut name = Self::default();
-        read_inner(decoder, &mut name, None)?;
+        read_inner(decoder, &mut name)?;
         Ok(name)
     }
 }
 
-fn read_inner(
-    decoder: &mut BinDecoder<'_>,
-    name: &mut Name,
-    max_idx: Option<usize>,
-) -> Result<(), DecodeError> {
+fn read_inner(decoder: &mut BinDecoder<'_>, name: &mut Name) -> Result<(), DecodeError> {
     let mut state: LabelParseState = LabelParseState::LabelLengthOrPointer;
-    let name_start = decoder.index();
+    let mut ptr_max_idx = None;
+    let mut decoder_tmp;
+    let mut decoder = &mut *decoder;
+    let mut name_start = decoder.index();
 
     // assume all chars are utf-8. We're doing byte-by-byte operations, no endianness issues...
     // reserved: (1000 0000 aka 0800) && (0100 0000 aka 0400)
@@ -1242,8 +1247,8 @@ fn read_inner(
     // label: 03FF & slice = length; slice.next(length) = label
     // root: 0000
     loop {
-        // this protects against overlapping labels
-        if let Some(max_idx) = max_idx {
+        // this protects against overlapping labels when chasing pointers
+        if let Some(max_idx) = ptr_max_idx {
             if decoder.index() >= max_idx {
                 return Err(DecodeError::LabelOverlapsWithOther {
                     label: name_start,
@@ -1333,11 +1338,12 @@ fn read_inner(
                         ptr: e,
                     })?;
 
-                let mut pointer = decoder.clone(location);
-                read_inner(&mut pointer, name, Some(name_start))?;
-
-                // Pointers always finish the name, break like Root.
-                break;
+                // chase the pointer
+                ptr_max_idx = Some(name_start);
+                decoder_tmp = decoder.clone(location);
+                decoder = &mut decoder_tmp;
+                name_start = decoder.index();
+                LabelParseState::LabelLengthOrPointer
             }
             LabelParseState::Root => {
                 // need to pop() the 0 off the stack...
@@ -1654,6 +1660,31 @@ mod tests {
         let mut d = BinDecoder::new(&bytes);
 
         assert!(Name::read(&mut d).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_long_pointer_chain_small_stack() {
+        // Build a buffer of the form: [0x00, ptr->0, ptr->prev, ptr->prev, ...]
+        let mut bytes = vec![0x00, 0xC0, 0x00];
+        let mut last_ptr_offset: u16 = 1;
+        for _ in 1..8000 {
+            last_ptr_offset = bytes.len() as u16 - 2;
+            bytes.extend(&u16::to_be_bytes(0xC000 | last_ptr_offset));
+        }
+
+        // Formerly a stack overflow
+        let name = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut decoder = BinDecoder::new(&bytes).clone(last_ptr_offset);
+                Name::read(&mut decoder).unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(name, Name::root());
     }
 
     #[test]

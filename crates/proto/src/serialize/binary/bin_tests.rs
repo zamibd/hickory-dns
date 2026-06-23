@@ -59,13 +59,13 @@ fn get_u16_data() -> Vec<(u16, Vec<u8>)> {
 #[test]
 fn read_u16() {
     test_read_data_set(get_u16_data(), |mut d| {
-        d.read_u16().map(Restrict::unverified).map_err(Into::into)
+        d.read_u16().map(Restrict::unverified)
     });
 }
 
 #[test]
 fn emit_u16() {
-    test_emit_data_set(get_u16_data(), |e, d| e.emit_u16(d));
+    test_emit_data_set(get_u16_data(), |e, d| d.emit(e));
 }
 
 fn get_i32_data() -> Vec<(i32, Vec<u8>)> {
@@ -84,13 +84,13 @@ fn get_i32_data() -> Vec<(i32, Vec<u8>)> {
 #[test]
 fn read_i32() {
     test_read_data_set(get_i32_data(), |mut d| {
-        d.read_i32().map(Restrict::unverified).map_err(Into::into)
+        d.read_i32().map(Restrict::unverified)
     });
 }
 
 #[test]
 fn emit_i32() {
-    test_emit_data_set(get_i32_data(), |e, d| e.emit_i32(d));
+    test_emit_data_set(get_i32_data(), |e, d| d.emit(e));
 }
 
 #[allow(clippy::unreadable_literal)]
@@ -110,20 +110,20 @@ fn get_u32_data() -> Vec<(u32, Vec<u8>)> {
 #[test]
 fn read_u32() {
     test_read_data_set(get_u32_data(), |mut d| {
-        d.read_u32().map(Restrict::unverified).map_err(Into::into)
+        d.read_u32().map(Restrict::unverified)
     });
 }
 
 #[test]
 fn emit_u32() {
-    test_emit_data_set(get_u32_data(), |e, d| e.emit_u32(d));
+    test_emit_data_set(get_u32_data(), |e, d| d.emit(e));
 }
 
 #[cfg_attr(not(feature = "std"), expect(clippy::unused_enumerate_index))]
 pub(crate) fn test_read_data_set<E, F>(data_set: Vec<(E, Vec<u8>)>, read_func: F)
 where
     E: PartialEq<E> + Debug,
-    F: Fn(BinDecoder<'_>) -> ProtoResult<E>,
+    F: Fn(BinDecoder<'_>) -> Result<E, DecodeError>,
 {
     for (_test_pass, (expect, binary)) in data_set.into_iter().enumerate() {
         #[cfg(feature = "std")]

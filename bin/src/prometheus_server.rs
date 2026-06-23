@@ -1,20 +1,31 @@
 use std::future::{Ready, ready};
+use std::task::{Context, Poll};
 
 use http::header::CONTENT_TYPE;
-use hyper::{Request, Response, body::Incoming, service::Service};
+use hyper::{Request, Response, body::Incoming};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::{conn::auto::Builder, graceful::GracefulShutdown},
+    service::TowerToHyperService,
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tokio::{net::TcpListener, select, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tower::{Service, ServiceBuilder};
+use tower_http::compression::CompressionLayer;
 use tracing::{debug, error};
 
 #[cfg(any(feature = "__tls", feature = "__quic"))]
 use hickory_resolver::metrics::opportunistic_encryption::PROBE_DURATION_SECONDS;
 #[cfg(feature = "recursor")]
-use hickory_resolver::metrics::recursor::{CACHE_HIT_DURATION, CACHE_MISS_DURATION};
+use hickory_resolver::metrics::recursor::{
+    CACHE_HIT_DURATION as RECURSOR_CACHE_HIT_DURATION,
+    CACHE_MISS_DURATION as RECURSOR_CACHE_MISS_DURATION,
+};
+use hickory_resolver::metrics::{
+    CACHE_HIT_DURATION as RESOLVER_CACHE_HIT_DURATION,
+    CACHE_MISS_DURATION as RESOLVER_CACHE_MISS_DURATION,
+};
 
 /// An HTTP server that responds to Prometheus scrape requests.
 pub(crate) struct PrometheusServer {
@@ -54,7 +65,12 @@ impl PrometheusServer {
                     },
                 };
                 let io = TokioIo::new(stream);
-                let conn = builder.serve_connection_with_upgrades(io, service.clone());
+                let svc = TowerToHyperService::new(
+                    ServiceBuilder::new()
+                        .layer(CompressionLayer::new())
+                        .service(service.clone()),
+                );
+                let conn = builder.serve_connection_with_upgrades(io, svc);
                 let conn = shutdown.watch(conn.into_owned());
                 tokio::spawn(async move {
                     if let Err(error) = conn.await {
@@ -99,7 +115,11 @@ impl Service<Request<Incoming>> for PrometheusService {
     type Future =
         Ready<Result<Response<String>, Box<dyn std::error::Error + Send + Sync + 'static>>>;
 
-    fn call(&self, _req: Request<Incoming>) -> Self::Future {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: Request<Incoming>) -> Self::Future {
         let response_builder =
             Response::builder().header(CONTENT_TYPE, "text/plain; version=0.0.4");
         match response_builder.body(self.handle.render()) {
@@ -132,16 +152,17 @@ fn configure_buckets(mut builder: PrometheusBuilder) -> PrometheusBuilder {
 const HISTOGRAMS: &[(&str, &[f64])] = &[
     #[cfg(any(feature = "__tls", feature = "__quic"))]
     (PROBE_DURATION_SECONDS, INTERNET_LATENCY_BUCKETS),
+    (RESOLVER_CACHE_MISS_DURATION, INTERNET_LATENCY_BUCKETS),
+    (RESOLVER_CACHE_HIT_DURATION, INTERNAL_LATENCY_BUCKETS),
     #[cfg(feature = "recursor")]
-    (CACHE_MISS_DURATION, INTERNET_LATENCY_BUCKETS),
+    (RECURSOR_CACHE_MISS_DURATION, INTERNET_LATENCY_BUCKETS),
     #[cfg(feature = "recursor")]
-    (CACHE_HIT_DURATION, INTERNAL_LATENCY_BUCKETS),
+    (RECURSOR_CACHE_HIT_DURATION, INTERNAL_LATENCY_BUCKETS),
 ];
 
 /// Histogram buckets for operations that traverse the internet to remote systems.
 ///
 /// The values used are matched to the Go client defaults.
-#[cfg(any(feature = "recursor", feature = "__tls", feature = "__quic"))]
 const INTERNET_LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
@@ -149,7 +170,6 @@ const INTERNET_LATENCY_BUCKETS: &[f64] = &[
 /// Histogram buckets for internal operations that don't depend on remote systems.
 ///
 /// The values used are a range of buckets between 100μs and 100ms.
-#[cfg(feature = "recursor")]
 const INTERNAL_LATENCY_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
 ];

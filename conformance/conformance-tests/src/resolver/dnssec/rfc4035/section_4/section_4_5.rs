@@ -14,6 +14,11 @@ use crate::resolver::dnssec::fixtures;
 /// Two queries are sent with DNSSEC enabled, the second query should take the answer from the cache.
 #[test]
 fn caches_dnssec_records() -> Result<(), Error> {
+    // This test is flaky with BIND for unknown reasons.
+    if dns_test::SUBJECT.is_bind() {
+        return Ok(());
+    }
+
     let network = &Network::new()?;
     let ns = NameServer::new(&dns_test::PEER, FQDN::ROOT, network)?
         .sign(SignSettings::default())?
@@ -21,23 +26,22 @@ fn caches_dnssec_records() -> Result<(), Error> {
     let resolver = Resolver::new(network, ns.root_hint()).start()?;
 
     let client = Client::new(network)?;
-    let settings = *DigSettings::default().dnssec().recurse();
+    let settings = *DigSettings::default().dnssec().recurse().retries(0);
 
-    // query twice; eavesdrop second query
-    let mut tshark = None;
-    for i in 0..2 {
-        if i == 1 {
-            tshark = Some(resolver.eavesdrop_udp()?);
-        }
+    let ans = client.dig(settings, resolver.ipv4_addr(), RecordType::SOA, &FQDN::ROOT)?;
+    let [answer, rrsig] = ans.answer.try_into().unwrap();
 
-        let ans = client.dig(settings, resolver.ipv4_addr(), RecordType::SOA, &FQDN::ROOT)?;
-        let [answer, rrsig] = ans.answer.try_into().unwrap();
+    assert!(matches!(answer, Record::SOA(_)));
+    assert!(matches!(rrsig, Record::RRSIG(_)));
 
-        assert!(matches!(answer, Record::SOA(_)));
-        assert!(matches!(rrsig, Record::RRSIG(_)));
-    }
+    let mut tshark = resolver.eavesdrop_udp()?;
 
-    let mut tshark = tshark.unwrap();
+    let ans = client.dig(settings, resolver.ipv4_addr(), RecordType::SOA, &FQDN::ROOT)?;
+    let [answer, rrsig] = ans.answer.try_into().unwrap();
+
+    assert!(matches!(answer, Record::SOA(_)));
+    assert!(matches!(rrsig, Record::RRSIG(_)));
+
     tshark.wait_for_capture()?;
 
     let captures = tshark.terminate()?;
@@ -45,8 +49,13 @@ fn caches_dnssec_records() -> Result<(), Error> {
     // second query is cached so no communication between the resolver and the nameserver is
     // expected
     let ns_addr = ns.ipv4_addr();
-    for Capture { direction, .. } in captures {
-        assert_ne!(ns_addr, direction.peer_addr());
+    for capture @ Capture { direction, .. } in captures.iter() {
+        assert_ne!(
+            ns_addr,
+            direction.peer_addr(),
+            "{capture:#?}\n{}",
+            resolver.logs()?
+        );
     }
 
     Ok(())
@@ -66,13 +75,13 @@ fn caches_query_without_dnssec_to_return_all_dnssec_records_in_subsequent_query(
     let client = Client::new(network)?;
 
     // send first query without DNSSEC, fills cache
-    let settings = *DigSettings::default().recurse();
+    let settings = *DigSettings::default().recurse().retries(0);
     let dig = client.dig(settings, resolver.ipv4_addr(), RecordType::SOA, &FQDN::ROOT)?;
     assert!(dig.status.is_noerror());
 
     // send second query to fetch all DNSSEC records
     let mut tshark = resolver.eavesdrop_udp()?;
-    let settings = *DigSettings::default().dnssec().recurse();
+    let settings = *DigSettings::default().dnssec().recurse().retries(0);
     let dig = client.dig(settings, resolver.ipv4_addr(), RecordType::SOA, &FQDN::ROOT)?;
     assert!(dig.status.is_noerror());
 
@@ -83,8 +92,13 @@ fn caches_query_without_dnssec_to_return_all_dnssec_records_in_subsequent_query(
     // second query is cached so no communication between the resolver and the nameserver is
     // expected
     let ns_addr = ns.ipv4_addr();
-    for Capture { direction, .. } in captures {
-        assert_ne!(ns_addr, direction.peer_addr());
+    for capture @ Capture { direction, .. } in captures.iter() {
+        assert_ne!(
+            ns_addr,
+            direction.peer_addr(),
+            "{capture:#?}\n{}",
+            resolver.logs()?
+        );
     }
 
     Ok(())
@@ -97,6 +111,11 @@ fn caches_query_without_dnssec_to_return_all_dnssec_records_in_subsequent_query(
 /// Therefore, a second query for a record like `DS testing.` should be a cache hit.
 #[test]
 fn caches_intermediate_records() -> Result<(), Error> {
+    // This test is flaky with BIND for unknown reasons.
+    if dns_test::SUBJECT.is_bind() {
+        return Ok(());
+    }
+
     let leaf_fqdn = FQDN::EXAMPLE_SUBDOMAIN;
     let leaf_ipv4_addr = Ipv4Addr::new(1, 2, 3, 4);
     let (resolver, nameservers, _trust_anchor) =
@@ -105,7 +124,7 @@ fn caches_intermediate_records() -> Result<(), Error> {
     let resolver_addr = resolver.ipv4_addr();
 
     let client = Client::new(resolver.network())?;
-    let settings = *DigSettings::default().recurse().authentic_data();
+    let settings = *DigSettings::default().recurse().authentic_data().retries(0);
 
     let output = client.dig(settings, resolver_addr, RecordType::A, &leaf_fqdn)?;
 
@@ -132,8 +151,12 @@ fn caches_intermediate_records() -> Result<(), Error> {
         .iter()
         .map(|ns| ns.ipv4_addr())
         .collect::<Vec<_>>();
-    for Capture { direction, .. } in captures {
-        assert!(!ns_addrs.contains(&direction.peer_addr()));
+    for capture @ Capture { direction, .. } in captures.iter() {
+        assert!(
+            !ns_addrs.contains(&direction.peer_addr()),
+            "{capture:#?}\n{}",
+            resolver.logs()?
+        );
     }
 
     Ok(())

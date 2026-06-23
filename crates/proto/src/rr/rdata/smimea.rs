@@ -10,7 +10,10 @@ use super::tlsa::{CertUsage, Matching, Selector, TLSA};
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, Restrict},
+    serialize::{
+        binary::{BinDecoder, BinEncodable, BinEncoder, DecodeError, Restrict},
+        txt::ParseError,
+    },
 };
 
 /// [RFC 8162](https://datatracker.ietf.org/doc/html/rfc8162#section-2)
@@ -19,7 +22,7 @@ use crate::{
 /// > the [TLSA] record
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct SMIMEA(TLSA);
+pub struct SMIMEA(pub TLSA);
 
 impl SMIMEA {
     /// Construct a new SMIMEA
@@ -49,6 +52,13 @@ impl SMIMEA {
     ) -> Self {
         Self(TLSA::new(cert_usage, selector, matching, cert_data))
     }
+
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        tokens: I,
+    ) -> Result<Self, ParseError> {
+        TLSA::from_tokens(tokens).map(Self)
+    }
 }
 
 /// This implementation allows calling the associated functions of [TLSA] on [SMIMEA].
@@ -70,7 +80,7 @@ impl BinEncodable for SMIMEA {
 
 impl RecordDataDecodable<'_> for SMIMEA {
     #[inline]
-    fn read_data(decoder: &mut BinDecoder<'_>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'_>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         TLSA::read_data(decoder, length).map(Self)
     }
 }
@@ -95,5 +105,42 @@ impl RecordData for SMIMEA {
 impl fmt::Display for SMIMEA {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parsing() {
+        assert!(
+            SMIMEA::from_tokens(
+                vec![
+                    "0",
+                    "0",
+                    "1",
+                    "d2abde240d7cd3ee6b4b28c54df034b9",
+                    "7983a1d16e8a410e4561cb106618e971",
+                ]
+                .into_iter()
+            )
+            .is_ok()
+        );
+        assert!(
+            SMIMEA::from_tokens(
+                vec![
+                    "1",
+                    "1",
+                    "2",
+                    "92003ba34942dc74152e2f2c408d29ec",
+                    "a5a520e7f2e06bb944f4dca346baf63c",
+                    "1b177615d466f6c4b71c216a50292bd5",
+                    "8c9ebdd2f74e38fe51ffd48c43326cbc",
+                ]
+                .into_iter()
+            )
+            .is_ok()
+        );
     }
 }

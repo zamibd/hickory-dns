@@ -143,7 +143,7 @@ impl InnerInMemory {
                 continue;
             };
 
-            let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = record.data() else {
+            let RData::DNSSEC(DNSSECRData::NSEC(nsec)) = &record.data else {
                 continue;
             };
 
@@ -165,7 +165,7 @@ impl InnerInMemory {
         let rr_key = RrKey::new(origin.clone(), RecordType::SOA);
 
         self.records.get(&rr_key).and_then(|rrset| {
-            match rrset.records_without_rrsigs().next()?.data() {
+            match &rrset.records_without_rrsigs().next()?.data {
                 RData::SOA(soa) => Some(soa),
                 _ => None,
             }
@@ -175,7 +175,7 @@ impl InnerInMemory {
     /// Returns the minimum ttl (as used in the SOA record)
     pub(super) fn minimum_ttl(&self, origin: &LowerName) -> u32 {
         match self.inner_soa(origin) {
-            Some(soa) => soa.minimum(),
+            Some(soa) => soa.minimum,
             None => {
                 error!("could not lookup SOA for zone handler: {origin}");
                 0
@@ -186,7 +186,7 @@ impl InnerInMemory {
     /// get the current serial number for the zone.
     pub(super) fn serial(&self, origin: &LowerName) -> u32 {
         match self.inner_soa(origin) {
-            Some(soa) => soa.serial(),
+            Some(soa) => soa.serial,
             None => {
                 error!("could not lookup SOA for zone handler: {origin}");
                 0
@@ -200,6 +200,31 @@ impl InnerInMemory {
         record_type: RecordType,
         lookup_options: LookupOptions,
     ) -> Option<Arc<RecordSet>> {
+        // Check for delegation
+        let mut search_name = name.clone();
+        while !search_name.is_root() {
+            let ns_key = RrKey::new(search_name.clone(), RecordType::NS);
+            let soa_key = RrKey::new(search_name.clone(), RecordType::SOA);
+
+            let ns_rrset = self.records.get(&ns_key);
+            let has_soa = self.records.contains_key(&soa_key);
+            let ds_exact = record_type == RecordType::DS && search_name == *name;
+
+            match (ns_rrset, has_soa) {
+                // Request is for a DS record and we're at the delegation point.
+                // Don't return a referral, DS record resides in the parent zone.
+                (Some(_), false) if ds_exact => {}
+                // Return a delegation point: NS exists without SOA.
+                (Some(ns), false) => return Some(ns.clone()),
+                // Zone apex: NS with SOA - we're at the top of the zone
+                (Some(_), true) => break,
+                // No NS, keep walking up.
+                (None, _) => {}
+            }
+
+            search_name = search_name.base_name();
+        }
+
         // this range covers all the records for any of the RecordTypes at a given label.
         let start_range_key = RrKey::new(name.clone(), RecordType::Unknown(u16::MIN));
         let end_range_key = RrKey::new(name.clone(), RecordType::Unknown(u16::MAX));
@@ -273,14 +298,14 @@ impl InnerInMemory {
             };
 
             for record in records {
-                new_answer.add_rdata(record.data().clone());
+                new_answer.add_rdata(record.data.clone());
             }
 
             #[cfg(feature = "__dnssec")]
             for rrsig in _rrsigs {
                 let mut rrsig = rrsig.clone();
-                if *rrsig.name() == *wildcard {
-                    rrsig.set_name(Name::from(name));
+                if rrsig.name == *wildcard {
+                    rrsig.name = Name::from(name);
                 }
                 new_answer.insert_rrsig(rrsig)
             }
@@ -340,15 +365,17 @@ impl InnerInMemory {
                 let additional = self.inner_lookup(&search, *query_type, lookup_options);
                 names.insert(search);
 
-                if let Some(additional) = additional {
-                    // assuming no crazy long chains...
-                    if !additionals.contains(&additional) {
-                        additionals.push(additional.clone());
-                    }
+                let Some(additional) = additional else {
+                    continue;
+                };
 
-                    next_name =
-                        maybe_next_name(&additional, *query_type).map(|(name, _search_type)| name);
+                // assuming no crazy long chains...
+                if !additionals.contains(&additional) {
+                    additionals.push(additional.clone());
                 }
+
+                next_name =
+                    maybe_next_name(&additional, *query_type).map(|(name, _search_type)| name);
             }
         }
 
@@ -374,9 +401,9 @@ impl InnerInMemory {
             return 0;
         };
 
-        let serial = if let RData::SOA(soa_rdata) = record.data_mut() {
+        let serial = if let RData::SOA(soa_rdata) = &mut record.data {
             soa_rdata.increment_serial();
-            soa_rdata.serial()
+            soa_rdata.serial
         } else {
             panic!("This was not an SOA record"); // valid panic, never should happen
         };
@@ -398,11 +425,10 @@ impl InnerInMemory {
     ///
     /// true if the value was inserted, false otherwise
     pub(super) fn upsert(&mut self, record: Record, serial: u32, dns_class: DNSClass) -> bool {
-        if dns_class != record.dns_class() {
+        if dns_class != record.dns_class {
             warn!(
                 "mismatched dns_class on record insert, zone: {} record: {}",
-                dns_class,
-                record.dns_class()
+                dns_class, record.dns_class
             );
             return false;
         }
@@ -435,8 +461,8 @@ impl InnerInMemory {
         }
 
         // check that CNAME and ANAME is either not already present, or no other records are if it's a CNAME
-        let start_range_key = RrKey::new(record.name().into(), RecordType::Unknown(u16::MIN));
-        let end_range_key = RrKey::new(record.name().into(), RecordType::Unknown(u16::MAX));
+        let start_range_key = RrKey::new((&record.name).into(), RecordType::Unknown(u16::MIN));
+        let end_range_key = RrKey::new((&record.name).into(), RecordType::Unknown(u16::MAX));
 
         let multiple_records_at_label_disallowed = self
             .records
@@ -456,10 +482,10 @@ impl InnerInMemory {
             return false;
         }
 
-        let rr_key = RrKey::new(record.name().into(), record.record_type());
+        let rr_key = RrKey::new((&record.name).into(), record.record_type());
         let records: &mut Arc<RecordSet> = self.records.entry(rr_key).or_insert_with(|| {
             Arc::new(RecordSet::new(
-                record.name().clone(),
+                record.name.clone(),
                 record.record_type(),
                 serial,
             ))
@@ -867,4 +893,69 @@ fn finish_nsec_record(
 ) -> Record {
     let rdata = NSEC::new_cover_self(next_name.clone(), mem::take(record_type_set));
     Record::from_rdata(name.clone(), ttl, RData::DNSSEC(DNSSECRData::NSEC(rdata)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+    use crate::proto::rr::{Name, Record, rdata::NS};
+
+    #[test]
+    fn test_inner_lookup_delegation() {
+        let origin = Name::from_str("example.com.").unwrap();
+        let sub = Name::from_str("sub.example.com.").unwrap();
+        let ns_name = Name::from_str("ns.example.com.").unwrap();
+        let mut inner = InnerInMemory::default();
+
+        // Add SOA for example.com
+        let soa = Record::from_rdata(
+            origin.clone(),
+            3600,
+            RData::SOA(SOA::new(
+                ns_name.clone(),
+                Name::from_str("hostmaster.example.com.").unwrap(),
+                1,
+                3600,
+                3600,
+                3600,
+                3600,
+            )),
+        );
+        inner.upsert(soa, 1, DNSClass::IN);
+
+        // Add NS delegation for sub.example.com
+        let ns = Record::from_rdata(sub.clone(), 3600, RData::NS(NS(ns_name.clone())));
+        inner.upsert(ns, 1, DNSClass::IN);
+
+        // Lookup A record in sub.example.com (should return referral)
+        let query_name = Name::from_str("www.sub.example.com.").unwrap();
+        let result =
+            inner.inner_lookup(&query_name.into(), RecordType::A, LookupOptions::default());
+
+        assert!(result.is_some());
+        let rrset = result.unwrap();
+        assert_eq!(rrset.record_type(), RecordType::NS);
+        assert_eq!(rrset.name(), &sub);
+
+        // Lookup DS record at delegation point (should NOT return referral)
+        let result = inner.inner_lookup(
+            &sub.clone().into(),
+            RecordType::DS,
+            LookupOptions::default(),
+        );
+        assert!(result.is_none());
+
+        // Lookup NS record at delegation point (should return NS record)
+        let result = inner.inner_lookup(
+            &sub.clone().into(),
+            RecordType::NS,
+            LookupOptions::default(),
+        );
+        assert!(result.is_some());
+        let rrset = result.unwrap();
+        assert_eq!(rrset.record_type(), RecordType::NS);
+        assert_eq!(rrset.name(), &sub);
+    }
 }

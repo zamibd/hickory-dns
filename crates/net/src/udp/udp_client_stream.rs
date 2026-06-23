@@ -180,7 +180,7 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
             Err(err) => return Err(err.into()),
         };
 
-        let msg_id = request.id();
+        let msg_id = request.id;
         let msg = SerialMessage::new(request_bytes, self.name_server);
         let addr = msg.addr();
         let final_message = match msg.to_message() {
@@ -243,25 +243,18 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
                 continue;
             }
 
-            let mut response = match DnsResponse::from_buffer(response_buffer) {
-                Ok(response) => response,
-                Err(e) => {
-                    // on errors deserializing, continue
-                    warn!("dropped malformed message waiting for id: {msg_id} err: {e}");
-                    continue;
-                }
-            };
+            let mut response = DnsResponse::from_buffer(response_buffer)?;
 
             // Validate the message id in the response matches the value chosen for the query.
-            if msg_id != response.id() {
+            if msg_id != response.id {
                 // on wrong id, attempted poison?
                 warn!(
                     "expected message id: {} got: {}, dropped",
-                    msg_id,
-                    response.id()
+                    msg_id, response.id
                 );
 
-                return Err(NetError::BadTransactionId);
+                // await an answer with the correct message id
+                continue;
             }
 
             // Validate the returned query name.
@@ -290,8 +283,8 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
             // receives unsolicited responses or RR data other than that
             // requested, it should discard it without caching it.
             let request_message = Message::from_vec(msg.bytes())?;
-            let request_queries = request_message.queries();
-            let response_queries = response.queries_mut();
+            let request_queries = &request_message.queries;
+            let response_queries = &mut response.queries;
 
             let question_matches = response_queries
                 .iter()
@@ -301,7 +294,7 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
                 && !response_queries.iter().all(|elem| {
                     request_queries
                         .iter()
-                        .any(|req_q| req_q == elem && req_q.name().eq_case(elem.name()))
+                        .any(|req_q| req_q == elem && req_q.name.eq_case(&elem.name))
                 })
             {
                 warn!(
@@ -327,7 +320,7 @@ impl<P: RuntimeProvider> Request for UdpRequest<P> {
                 }
             }
 
-            debug!("received message id: {}", response.id());
+            debug!("received message id: {}", response.id);
             #[cfg(feature = "__dnssec")]
             if let Some(mut verifier) = verifier {
                 return Ok(verifier.verify(response_bytes)?);
@@ -560,8 +553,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_handler_test() -> Result<(), NetError> {
-        let mut message = Message::query();
-        message.set_response_code(ResponseCode::NoError);
+        let mut message = Message::query().into_response();
+        message.metadata.response_code = ResponseCode::NoError;
 
         let ret = retry::<TokioRuntimeProvider>(
             FixedResponse {
@@ -571,7 +564,7 @@ mod tests {
             5,
         )
         .await?;
-        assert_eq!(ret.response_code(), ResponseCode::NoError);
+        assert_eq!(ret.response_code, ResponseCode::NoError);
 
         // test: retry timer doesn't fire extra tasks before the retry interval
         let (req, tries) = DelayedResponse::new(

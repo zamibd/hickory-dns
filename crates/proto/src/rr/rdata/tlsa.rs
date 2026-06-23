@@ -6,20 +6,21 @@
 // copied, modified, or distributed except according to those terms.
 
 //! TLSA records for storing TLS certificate validation information
-#![allow(clippy::use_self)]
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::fmt;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use super::sshfp;
-
 use crate::{
-    error::{ProtoError, ProtoResult},
+    error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, Restrict, RestrictedMath},
+    serialize::{
+        binary::{BinDecoder, BinEncodable, BinEncoder, DecodeError, Restrict, RestrictedMath},
+        txt::ParseError,
+    },
 };
 
 /// [RFC 6698, DNS-Based Authentication for TLS](https://tools.ietf.org/html/rfc6698#section-2.1)
@@ -43,11 +44,21 @@ use crate::{
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct TLSA {
-    cert_usage: CertUsage,
-    selector: Selector,
-    matching: Matching,
-    cert_data: Vec<u8>,
+    /// Specifies the provided association that will be used to match the certificate
+    /// presented in the TLS handshake
+    pub cert_usage: CertUsage,
+
+    /// Specifies which part of the TLS certificate presented by the server will be
+    /// matched against the association data
+    pub selector: Selector,
+
+    /// Specifies how the certificate association is presented
+    pub matching: Matching,
+
+    /// Binary data for validating the cert, see other members to understand format
+    pub cert_data: Vec<u8>,
 }
 
 /// [RFC 6698, DNS-Based Authentication for TLS](https://tools.ietf.org/html/rfc6698#section-2.1.1)
@@ -353,33 +364,76 @@ impl TLSA {
         }
     }
 
-    /// Specifies the provided association that will be used to match the certificate presented in the TLS handshake
-    pub fn cert_usage(&self) -> CertUsage {
-        self.cert_usage
-    }
+    /// Parse the RData from a set of Tokens
+    ///
+    /// [RFC 6698, DNS-Based Authentication for TLS](https://tools.ietf.org/html/rfc6698#section-2.2)
+    ///
+    /// ```text
+    /// 2.2.  TLSA RR Presentation Format
+    ///
+    ///    The presentation format of the RDATA portion (as defined in
+    ///    [RFC1035]) is as follows:
+    ///
+    ///    o  The certificate usage field MUST be represented as an 8-bit
+    ///       unsigned integer.
+    ///
+    ///    o  The selector field MUST be represented as an 8-bit unsigned
+    ///       integer.
+    ///
+    ///    o  The matching type field MUST be represented as an 8-bit unsigned
+    ///       integer.
+    ///
+    ///    o  The certificate association data field MUST be represented as a
+    ///       string of hexadecimal characters.  Whitespace is allowed within
+    ///       the string of hexadecimal characters, as described in [RFC1035].
+    /// ```
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        tokens: I,
+    ) -> Result<Self, ParseError> {
+        let mut iter = tokens;
 
-    /// Specifies which part of the TLS certificate presented by the server will be matched against the association data
-    pub fn selector(&self) -> Selector {
-        self.selector
-    }
+        let token: &str = iter
+            .next()
+            .ok_or(ParseError::Message("TLSA usage field missing"))?;
+        let cert_usage = CertUsage::from(to_u8(token)?);
 
-    /// Specifies how the certificate association is presented
-    pub fn matching(&self) -> Matching {
-        self.matching
-    }
+        let token = iter
+            .next()
+            .ok_or(ParseError::Message("TLSA selector field missing"))?;
+        let selector = to_u8(token)?.into();
 
-    /// Binary data for validating the cert, see other members to understand format
-    pub fn cert_data(&self) -> &[u8] {
-        &self.cert_data
+        let token = iter
+            .next()
+            .ok_or(ParseError::Message("TLSA matching field missing"))?;
+        let matching = to_u8(token)?.into();
+
+        // these are all in hex: "a string of hexadecimal characters"
+        //   aside: personally I find it funny that the other fields are decimal, while this is hex encoded...
+        let cert_data = iter.fold(String::new(), |mut cert_data, data| {
+            cert_data.push_str(data);
+            cert_data
+        });
+        let cert_data = sshfp::HEX.decode(cert_data.as_bytes())?;
+
+        if !cert_data.is_empty() {
+            Ok(Self {
+                cert_usage,
+                selector,
+                matching,
+                cert_data,
+            })
+        } else {
+            Err(ParseError::Message("TLSA data field missing"))
+        }
     }
 }
 
 impl BinEncodable for TLSA {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u8(self.cert_usage.into())?;
-        encoder.emit_u8(self.selector.into())?;
-        encoder.emit_u8(self.matching.into())?;
-        encoder.emit_vec(&self.cert_data)?;
+        u8::from(self.cert_usage).emit(encoder)?;
+        u8::from(self.selector).emit(encoder)?;
+        u8::from(self.matching).emit(encoder)?;
+        encoder.emit_slice(&self.cert_data)?;
         Ok(())
     }
 }
@@ -398,7 +452,10 @@ impl RecordDataDecodable<'_> for TLSA {
     ///    /                                                               /
     ///    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     /// ```
-    fn read_data(decoder: &mut BinDecoder<'_>, rdata_length: Restrict<u16>) -> ProtoResult<TLSA> {
+    fn read_data(
+        decoder: &mut BinDecoder<'_>,
+        rdata_length: Restrict<u16>,
+    ) -> Result<Self, DecodeError> {
         let cert_usage = decoder.read_u8()?.unverified(/*CertUsage is verified*/).into();
         let selector = decoder.read_u8()?.unverified(/*Selector is verified*/).into();
         let matching = decoder.read_u8()?.unverified(/*Matching is verified*/).into();
@@ -407,7 +464,7 @@ impl RecordDataDecodable<'_> for TLSA {
         let cert_len = rdata_length
         .map(|u| u as usize)
         .checked_sub(3)
-        .map_err(|_| ProtoError::from("invalid rdata length in TLSA"))?
+        .map_err(|len| DecodeError::IncorrectRDataLengthRead { read: 3, len })?
         .unverified(/*used purely as length safely*/);
         let cert_data = decoder.read_vec(cert_len)?.unverified(/*will fail in usage if invalid*/);
 
@@ -496,6 +553,10 @@ impl fmt::Display for TLSA {
             cert = sshfp::HEX.encode(&self.cert_data),
         )
     }
+}
+
+fn to_u8(data: &str) -> Result<u8, ParseError> {
+    data.parse().map_err(ParseError::from)
 }
 
 #[cfg(test)]
@@ -599,5 +660,37 @@ mod tests {
             Matching::Unassigned(6),
             vec![1, 2, 3, 4, 5, 6, 7, 8],
         ));
+    }
+
+    #[test]
+    fn test_parsing() {
+        assert!(
+            TLSA::from_tokens(
+                vec![
+                    "0",
+                    "0",
+                    "1",
+                    "d2abde240d7cd3ee6b4b28c54df034b9",
+                    "7983a1d16e8a410e4561cb106618e971",
+                ]
+                .into_iter()
+            )
+            .is_ok()
+        );
+        assert!(
+            TLSA::from_tokens(
+                vec![
+                    "1",
+                    "1",
+                    "2",
+                    "92003ba34942dc74152e2f2c408d29ec",
+                    "a5a520e7f2e06bb944f4dca346baf63c",
+                    "1b177615d466f6c4b71c216a50292bd5",
+                    "8c9ebdd2f74e38fe51ffd48c43326cbc",
+                ]
+                .into_iter()
+            )
+            .is_ok()
+        );
     }
 }

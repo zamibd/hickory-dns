@@ -11,7 +11,7 @@
 #[cfg(feature = "__dnssec")]
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::{convert::TryInto, fmt};
+use core::fmt;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,8 @@ use crate::{
         record_data::RData, record_type::RecordType,
     },
     serialize::binary::{
-        BinDecodable, BinDecoder, BinEncodable, BinEncoder, NameEncoding, RDataEncoding, Restrict,
-        RestrictedMath,
+        BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, NameEncoding,
+        RDataEncoding, Restrict, RestrictedMath,
     },
 };
 
@@ -148,14 +148,31 @@ use crate::{
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct TSIG {
-    algorithm: TsigAlgorithm,
-    time: u64,
-    fudge: u16,
-    mac: Vec<u8>,
-    oid: u16,
-    error: Option<TsigError>,
-    other: Vec<u8>,
+    /// The algorithm used for the authentication code
+    pub algorithm: TsigAlgorithm,
+
+    /// The time this TSIG was generated at
+    pub time: u64,
+
+    /// The max delta from `time` for remote to accept the signature
+    pub fudge: u16,
+
+    /// The Mac in this TSIG
+    pub mac: Vec<u8>,
+
+    /// The original ID
+    pub oid: u16,
+
+    /// The TSIG error RCODE
+    ///
+    /// This is separate from the top-level error RCODE of a response
+    /// See <https://www.rfc-editor.org/rfc/rfc8945.html#section-3>
+    pub error: Option<TsigError>,
+
+    /// Additional data relevant to this TSIG
+    pub other: Vec<u8>,
 }
 
 impl TSIG {
@@ -210,42 +227,6 @@ impl TSIG {
         }
     }
 
-    /// Returns the Mac in this TSIG
-    pub fn mac(&self) -> &[u8] {
-        &self.mac
-    }
-
-    /// Returns the time this TSIG was generated at
-    pub fn time(&self) -> u64 {
-        self.time
-    }
-
-    /// Returns the max delta from `time` for remote to accept the signature
-    pub fn fudge(&self) -> u16 {
-        self.fudge
-    }
-
-    /// Returns the algorithm used for the authentication code
-    pub fn algorithm(&self) -> &TsigAlgorithm {
-        &self.algorithm
-    }
-
-    /// Returns the TSIG error RCODE
-    ///
-    /// This is separate from the top-level error RCODE of a response
-    /// See <https://www.rfc-editor.org/rfc/rfc8945.html#section-3>
-    pub fn error(&self) -> &Option<TsigError> {
-        &self.error
-    }
-
-    /// Set the TSIG error RCODE
-    ///
-    /// This is separate from the top-level error RCODE of a response
-    /// See <https://www.rfc-editor.org/rfc/rfc8945.html#section-3>
-    pub fn set_error(&mut self, error: TsigError) {
-        self.error = Some(error)
-    }
-
     /// Emit TSIG RR and RDATA as used for computing MAC
     ///
     /// ```text
@@ -286,17 +267,20 @@ impl TSIG {
 
         key_name.emit(&mut encoder)?;
         DNSClass::ANY.emit(&mut encoder)?;
-        encoder.emit_u32(0)?; // TTL
+        0u32.emit(&mut encoder)?; // TTL
         self.algorithm.emit(&mut encoder)?;
-        encoder.emit_u16((self.time >> 32) as u16)?;
-        encoder.emit_u32(self.time as u32)?;
-        encoder.emit_u16(self.fudge)?;
-        encoder.emit_u16(match self.error {
+        ((self.time >> 32) as u16).emit(&mut encoder)?;
+        (self.time as u32).emit(&mut encoder)?;
+        self.fudge.emit(&mut encoder)?;
+
+        match self.error {
             None => 0,
             Some(err) => u16::from(err),
-        })?;
-        encoder.emit_u16(self.other.len() as u16)?;
-        encoder.emit_vec(&self.other)?;
+        }
+        .emit(&mut encoder)?;
+
+        (self.other.len() as u16).emit(&mut encoder)?;
+        encoder.emit_slice(&self.other)?;
         Ok(())
     }
 
@@ -337,29 +321,43 @@ impl BinEncodable for TSIG {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         let mut encoder = encoder.with_rdata_behavior(RDataEncoding::Other);
         self.algorithm.emit(&mut encoder)?;
-        encoder.emit_u16(
-            (self.time >> 32)
-                .try_into()
-                .map_err(|_| ProtoError::from("invalid time, overflow 48 bit counter in TSIG"))?,
-        )?;
-        encoder.emit_u32(self.time as u32)?; // this cast is supposed to truncate
-        encoder.emit_u16(self.fudge)?;
-        encoder.emit_u16(
-            self.mac
-                .len()
-                .try_into()
-                .map_err(|_| ProtoError::from("invalid mac, longer than 65535 B in TSIG"))?,
-        )?;
-        encoder.emit_vec(&self.mac)?;
-        encoder.emit_u16(self.oid)?;
-        encoder.emit_u16(match self.error {
+
+        match u16::try_from(self.time >> 32) {
+            Ok(high) => high.emit(&mut encoder)?,
+            Err(_) => {
+                return Err(ProtoError::from(
+                    "invalid time, overflow 48 bit counter in TSIG",
+                ));
+            }
+        }
+
+        (self.time as u32).emit(&mut encoder)?; // this cast is supposed to truncate
+        self.fudge.emit(&mut encoder)?;
+
+        match u16::try_from(self.mac.len()) {
+            Ok(mac_len) => mac_len.emit(&mut encoder)?,
+            Err(_) => return Err(ProtoError::from("invalid mac, longer than 65535 B in TSIG")),
+        }
+
+        encoder.emit_slice(&self.mac)?;
+        self.oid.emit(&mut encoder)?;
+
+        match self.error {
             None => 0,
             Some(err) => u16::from(err),
-        })?;
-        encoder.emit_u16(self.other.len().try_into().map_err(|_| {
-            ProtoError::from("invalid other_buffer, longer than 65535 B in TSIG")
-        })?)?;
-        encoder.emit_vec(&self.other)?;
+        }
+        .emit(&mut encoder)?;
+
+        match u16::try_from(self.other.len()) {
+            Ok(other_len) => other_len.emit(&mut encoder)?,
+            Err(_) => {
+                return Err(ProtoError::from(
+                    "invalid other_buffer, longer than 65535 B in TSIG",
+                ));
+            }
+        }
+
+        encoder.emit_slice(&self.other)?;
         Ok(())
     }
 }
@@ -388,10 +386,10 @@ impl<'r> RecordDataDecodable<'r> for TSIG {
     ///  /                                                               /
     ///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     /// ```
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         let end_idx = length.map(|rdl| rdl as usize)
         .checked_add(decoder.index())
-        .map_err(|_| ProtoError::from("rdata end position overflow"))? // no legal message is long enough to trigger that
+        .map_err(|len| DecodeError::IncorrectRDataLengthRead { read: decoder.index(), len })? // no legal message is long enough to trigger that
         .unverified(/*used only as length safely*/);
 
         let algorithm = TsigAlgorithm::read(decoder)?;
@@ -402,7 +400,10 @@ impl<'r> RecordDataDecodable<'r> for TSIG {
         let mac_size = decoder
             .read_u16()?
             .verify_unwrap(|&size| decoder.index() + size as usize + 6 /* 3 u16 */ <= end_idx)
-            .map_err(|_| ProtoError::from("invalid mac length in TSIG"))?;
+            .map_err(|size| DecodeError::IncorrectRDataLengthRead {
+                read: end_idx - decoder.index(),
+                len: size as usize + 6,
+            })?;
         let mac =
             decoder.read_vec(mac_size as usize)?.unverified(/*valid as any vec of the right size*/);
         let oid = decoder.read_u16()?.unverified(/*valid as any u16*/);
@@ -413,7 +414,10 @@ impl<'r> RecordDataDecodable<'r> for TSIG {
         let other_len = decoder
             .read_u16()?
             .verify_unwrap(|&size| decoder.index() + size as usize == end_idx)
-            .map_err(|_| ProtoError::from("invalid other length in TSIG"))?;
+            .map_err(|size| DecodeError::IncorrectRDataLengthRead {
+                read: end_idx - decoder.index(),
+                len: size as usize,
+            })?;
         let other = decoder.read_vec(other_len as usize)?.unverified(/*valid as any vec of the right size*/);
 
         Ok(Self {
@@ -645,7 +649,7 @@ impl BinEncodable for TsigAlgorithm {
 }
 
 impl BinDecodable<'_> for TsigAlgorithm {
-    fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
         let mut name = Name::read(decoder)?;
         name.set_fqdn(false);
         Ok(Self::from_name(name))
@@ -731,13 +735,15 @@ pub fn signed_bitmessage_to_buf(
     first_message: bool,
 ) -> ProtoResult<(Vec<u8>, Box<Record<TSIG>>)> {
     let mut decoder = BinDecoder::new(message);
-    let mut header = Header::read(&mut decoder)?;
+    let Header {
+        mut metadata,
+        mut counts,
+    } = Header::read(&mut decoder)?;
 
     // Adjust the header additional count down by one - this separates out the final
     // additional data TSIG record.
-    let adc = header.additional_count();
-    if adc > 0 {
-        header.set_additional_count(adc - 1);
+    if counts.additionals > 0 {
+        counts.additionals -= 1;
     } else {
         return Err(ProtoError::from(
             "missing tsig from response that must be authenticated",
@@ -748,31 +754,40 @@ pub fn signed_bitmessage_to_buf(
     let start_data = message.len() - decoder.len();
 
     // Advance past the queries.
-    let count = header.query_count();
+    let count = counts.queries;
     for _ in 0..count {
         Query::read(&mut decoder)?;
     }
 
     // Advance past answer and authority records together.
-    let answer_authority_count = header.answer_count() as usize + header.authority_count() as usize;
-    let (_, _, sig) = Message::read_records(&mut decoder, answer_authority_count, false)?;
+    let answer_authority_count = (counts.answers + counts.authorities) as usize;
+    let (_, _, sig) = Message::read_records(
+        &mut decoder,
+        answer_authority_count,
+        false,
+        metadata.op_code,
+    )?;
     debug_assert!(sig.is_none());
 
     // Advance past additional records, up to the final TSIG record.
-    let additional_count = header.additional_count() as usize;
-    let (_, _, sig) = Message::read_records(&mut decoder, additional_count, true)?;
+    let (_, _, sig) = Message::read_records(
+        &mut decoder,
+        counts.additionals as usize,
+        true,
+        metadata.op_code,
+    )?;
     debug_assert!(sig.is_none());
     // Note the position of the decoder ahead of the final additional data TSIG record.
     let end_data = message.len() - decoder.len();
 
     // Read the TSIG signature record.
-    let (_, _, sig) = Message::read_records(&mut decoder, 1, true)?;
+    let (_, _, sig) = Message::read_records(&mut decoder, 1, true, metadata.op_code)?;
     let Some(tsig_rr) = sig else {
         return Err(ProtoError::from("TSIG signature record not found"));
     };
 
-    let tsig = tsig_rr.data();
-    header.set_id(tsig.oid);
+    let tsig = &tsig_rr.data;
+    metadata.id = tsig.oid;
 
     // Construct the TBS data.
     let mut buf = Vec::with_capacity(message.len());
@@ -780,24 +795,24 @@ pub fn signed_bitmessage_to_buf(
 
     // Prepend the previous hash if provided.
     if let Some(previous_hash) = previous_hash {
-        encoder.emit_u16(previous_hash.len() as u16)?;
-        encoder.emit_vec(previous_hash)?;
+        (previous_hash.len() as u16).emit(&mut encoder)?;
+        encoder.emit_slice(previous_hash)?;
     }
 
     // Emit the header we modified to remove the TSIG additional record.
-    header.emit(&mut encoder)?;
+    Header { metadata, counts }.emit(&mut encoder)?;
 
     // Emit all the message data between the header and the TSIG record.
-    encoder.emit_vec(&message[start_data..end_data])?;
+    encoder.emit_slice(&message[start_data..end_data])?;
 
     if first_message {
         // Emit the TSIG pseudo-record when this is the first message.
-        tsig.emit_tsig_for_mac(&mut encoder, tsig_rr.name())?;
+        tsig.emit_tsig_for_mac(&mut encoder, &tsig_rr.name)?;
     } else {
         // Emit only time and fudge data for later messages.
-        encoder.emit_u16((tsig.time >> 32) as u16)?;
-        encoder.emit_u32(tsig.time as u32)?;
-        encoder.emit_u16(tsig.fudge)?;
+        ((tsig.time >> 32) as u16).emit(&mut encoder)?;
+        (tsig.time as u32).emit(&mut encoder)?;
+        tsig.fudge.emit(&mut encoder)?;
     }
 
     Ok((buf, tsig_rr))
@@ -814,7 +829,7 @@ pub fn make_tsig_record(name: Name, rdata: TSIG) -> Record<TSIG> {
     );
 
     //   CLASS:  This MUST be ANY.
-    tsig.set_dns_class(DNSClass::ANY);
+    tsig.dns_class = DNSClass::ANY;
     tsig
 }
 
@@ -895,7 +910,7 @@ mod tests {
             12345,
             60,
             vec![],
-            message.id(),
+            message.id,
             None,
             vec![],
         );
@@ -919,7 +934,8 @@ mod tests {
     #[cfg(feature = "__dnssec")]
     fn test_sign_encode_id_changed() {
         let mut message = Message::query();
-        message.set_id(123).add_answer(Record::stub());
+        message.metadata.id = 123;
+        message.answers.push(Record::stub());
 
         let key_name = Name::from_ascii("some.name").unwrap();
 
@@ -928,7 +944,7 @@ mod tests {
             12345,
             60,
             vec![],
-            message.id(),
+            message.id,
             None,
             vec![],
         );
@@ -942,7 +958,7 @@ mod tests {
         let message_byte = message.to_bytes().unwrap();
         let mut message = Message::from_bytes(&message_byte).unwrap();
 
-        message.set_id(456); // simulate the request id being changed due to request forwarding
+        message.metadata.id = 456; // simulate the request id being changed due to request forwarding
 
         let message_byte = message.to_bytes().unwrap();
 

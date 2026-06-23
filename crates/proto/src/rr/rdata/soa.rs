@@ -7,6 +7,7 @@
 
 //! start of authority record defining ownership and defaults for the zone
 
+use alloc::string::ToString;
 use core::fmt;
 
 #[cfg(feature = "serde")]
@@ -15,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordType, domain::Name},
-    serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder, RDataEncoding},
+    serialize::{
+        binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, RDataEncoding},
+        txt::{ParseError, parse_ttl},
+    },
 };
 
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
@@ -64,14 +68,71 @@ use crate::{
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct SOA {
-    mname: Name,
-    rname: Name,
-    serial: u32,
-    refresh: i32,
-    retry: i32,
-    expire: i32,
-    minimum: u32,
+    /// The `domain-name` of the name server that was the original or primary source of data for
+    /// this zone, i.e. the Primary Name Server.
+    ///
+    /// ```text
+    /// MNAME           The <domain-name> of the name server that was the
+    ///                 original or primary source of data for this zone.
+    /// ```
+    pub mname: Name,
+
+    /// A `domain-name` which specifies the mailbox of the person responsible for this zone, i.e.
+    /// the responsible name.
+    ///
+    /// ```text
+    /// RNAME           A <domain-name> which specifies the mailbox of the
+    ///                 person responsible for this zone.
+    /// ```
+    pub rname: Name,
+
+    /// The unsigned 32 bit version number of the original copy of the zone. Zone transfers
+    /// preserve this value. This value wraps and should be compared using sequence space arithmetic.
+    ///
+    /// ```text
+    /// SERIAL          The unsigned 32 bit version number of the original copy
+    ///                 of the zone.  Zone transfers preserve this value.  This
+    ///                 value wraps and should be compared using sequence space
+    ///                 arithmetic.
+    /// ```
+    pub serial: u32,
+
+    /// A 32 bit time interval before the zone should be refreshed, in seconds.
+    ///
+    /// ```text
+    /// REFRESH         A 32 bit time interval before the zone should be
+    ///                 refreshed.
+    /// ```
+    pub refresh: i32,
+
+    /// A 32 bit time interval that should elapse before a failed refresh should be retried,
+    /// in seconds.
+    ///
+    /// ```text
+    /// RETRY           A 32 bit time interval that should elapse before a
+    ///                 failed refresh should be retried.
+    /// ```
+    pub retry: i32,
+
+    /// A 32 bit time value that specifies the upper limit on the time interval that can elapse
+    /// before the zone is no longer authoritative, in seconds
+    ///
+    /// ```text
+    /// EXPIRE          A 32 bit time value that specifies the upper limit on
+    ///                 the time interval that can elapse before the zone is no
+    ///                 longer authoritative.
+    /// ```
+    pub expire: i32,
+
+    /// The unsigned 32 bit minimum TTL field that should be exported with any RR from this zone.
+    ///
+    /// ```text
+    /// MINIMUM         The unsigned 32 bit minimum TTL field that should be
+    ///                 exported with any RR from this zone.
+    /// ```
+    pub minimum: u32,
 }
 
 impl SOA {
@@ -110,101 +171,60 @@ impl SOA {
         }
     }
 
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+        origin: Option<&Name>,
+    ) -> Result<Self, ParseError> {
+        let mname: Name = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("mname".to_string()))
+            .and_then(|s| Name::parse(s, origin).map_err(ParseError::from))?;
+
+        let rname: Name = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("rname".to_string()))
+            .and_then(|s| Name::parse(s, origin).map_err(ParseError::from))?;
+
+        let serial: u32 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("serial".to_string()))
+            .and_then(parse_ttl)?;
+
+        let refresh: i32 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("refresh".to_string()))
+            .and_then(parse_ttl)?
+            .try_into()
+            .map_err(|_e| ParseError::from("refresh outside i32 range"))?;
+
+        let retry: i32 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("retry".to_string()))
+            .and_then(parse_ttl)?
+            .try_into()
+            .map_err(|_e| ParseError::from("retry outside i32 range"))?;
+
+        let expire: i32 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("expire".to_string()))
+            .and_then(parse_ttl)?
+            .try_into()
+            .map_err(|_e| ParseError::from("expire outside i32 range"))?;
+
+        let minimum: u32 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("minimum".to_string()))
+            .and_then(parse_ttl)?;
+
+        Ok(Self::new(
+            mname, rname, serial, refresh, retry, expire, minimum,
+        ))
+    }
+
     /// Increments the serial number by one
     pub fn increment_serial(&mut self) {
         self.serial += 1; // TODO: what to do on overflow?
-    }
-
-    /// ```text
-    /// MNAME           The <domain-name> of the name server that was the
-    ///                 original or primary source of data for this zone.
-    /// ```
-    ///
-    /// # Return value
-    ///
-    /// The `domain-name` of the name server that was the original or primary source of data for
-    /// this zone, i.e. the Primary Name Server.
-    pub fn mname(&self) -> &Name {
-        &self.mname
-    }
-
-    /// ```text
-    /// RNAME           A <domain-name> which specifies the mailbox of the
-    ///                 person responsible for this zone.
-    /// ```
-    ///
-    /// # Return value
-    ///
-    /// A `domain-name` which specifies the mailbox of the person responsible for this zone, i.e.
-    /// the responsible name.
-    pub fn rname(&self) -> &Name {
-        &self.rname
-    }
-
-    /// ```text
-    /// SERIAL          The unsigned 32 bit version number of the original copy
-    ///                 of the zone.  Zone transfers preserve this value.  This
-    ///                 value wraps and should be compared using sequence space
-    ///                 arithmetic.
-    /// ```
-    ///
-    /// # Return value
-    ///
-    /// The unsigned 32 bit version number of the original copy of the zone. Zone transfers
-    /// preserve this value. This value wraps and should be compared using sequence space arithmetic.
-    pub fn serial(&self) -> u32 {
-        self.serial
-    }
-
-    /// ```text
-    /// REFRESH         A 32 bit time interval before the zone should be
-    ///                 refreshed.
-    /// ```
-    ///
-    /// # Return value
-    ///
-    /// A 32 bit time interval before the zone should be refreshed, in seconds.
-    pub fn refresh(&self) -> i32 {
-        self.refresh
-    }
-
-    /// ```text
-    /// RETRY           A 32 bit time interval that should elapse before a
-    ///                 failed refresh should be retried.
-    /// ```
-    ///
-    /// # Return value
-    ///
-    /// A 32 bit time interval that should elapse before a failed refresh should be retried,
-    /// in seconds.
-    pub fn retry(&self) -> i32 {
-        self.retry
-    }
-
-    /// ```text
-    /// EXPIRE          A 32 bit time value that specifies the upper limit on
-    ///                 the time interval that can elapse before the zone is no
-    ///                 longer authoritative.
-    /// ```
-    ///
-    /// # Return value
-    ///
-    /// A 32 bit time value that specifies the upper limit on the time interval that can elapse
-    /// before the zone is no longer authoritative, in seconds
-    pub fn expire(&self) -> i32 {
-        self.expire
-    }
-
-    /// ```text
-    /// MINIMUM         The unsigned 32 bit minimum TTL field that should be
-    ///                 exported with any RR from this zone.
-    /// ```
-    ///
-    /// # Return value
-    ///
-    /// The unsigned 32 bit minimum TTL field that should be exported with any RR from this zone.
-    pub fn minimum(&self) -> u32 {
-        self.minimum
     }
 }
 
@@ -232,17 +252,16 @@ impl BinEncodable for SOA {
 
         self.mname.emit(&mut encoder)?;
         self.rname.emit(&mut encoder)?;
-        encoder.emit_u32(self.serial)?;
-        encoder.emit_i32(self.refresh)?;
-        encoder.emit_i32(self.retry)?;
-        encoder.emit_i32(self.expire)?;
-        encoder.emit_u32(self.minimum)?;
-        Ok(())
+        self.serial.emit(&mut encoder)?;
+        self.refresh.emit(&mut encoder)?;
+        self.retry.emit(&mut encoder)?;
+        self.expire.emit(&mut encoder)?;
+        self.minimum.emit(&mut encoder)
     }
 }
 
 impl<'r> BinDecodable<'r> for SOA {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         Ok(Self {
             mname: Name::read(decoder)?,
             rname: Name::read(decoder)?,
@@ -379,5 +398,38 @@ mod tests {
         let mut decoder: BinDecoder<'_> = BinDecoder::new(bytes);
         let read_rdata = SOA::read_data(&mut decoder, Restrict::new(len)).expect("Decoding error");
         assert_eq!(rdata, read_rdata);
+    }
+
+    #[test]
+    fn test_parse() {
+        use core::str::FromStr;
+
+        let soa_tokens = vec![
+            "hickory-dns.org.",
+            "root.hickory-dns.org.",
+            "199609203",
+            "8h",
+            "120m",
+            "7d",
+            "24h",
+        ];
+
+        let parsed_soa = SOA::from_tokens(
+            soa_tokens.into_iter(),
+            Some(&Name::from_str("example.com.").unwrap()),
+        )
+        .expect("failed to parse tokens");
+
+        let expected_soa = SOA::new(
+            "hickory-dns.org.".parse().unwrap(),
+            "root.hickory-dns.org.".parse().unwrap(),
+            199609203,
+            28800,
+            7200,
+            604800,
+            86400,
+        );
+
+        assert_eq!(parsed_soa, expected_soa);
     }
 }

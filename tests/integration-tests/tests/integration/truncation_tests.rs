@@ -43,12 +43,12 @@ async fn test_truncation() {
     let max_payload = 512;
     let mut msg = Message::query();
     msg.add_query({
-        let mut query = Query::query(large_name(), RecordType::A);
+        let mut query = Query::new(large_name(), RecordType::A);
         query.set_query_class(DNSClass::IN);
         query
-    })
-    .set_recursion_desired(true)
-    .set_edns({
+    });
+    msg.metadata.recursion_desired = true;
+    msg.edns = Some({
         let mut edns = Edns::new();
         edns.set_max_payload(max_payload).set_version(0);
         edns
@@ -60,7 +60,7 @@ async fn test_truncation() {
         .await
         .expect("query failed");
 
-    assert!(result.truncated());
+    assert!(result.metadata.truncation);
     assert_eq!(max_payload, result.max_payload());
 
     server.shutdown_gracefully().await.unwrap();

@@ -105,17 +105,17 @@ async fn test_server_unknown_type() {
         .await
         .expect("query failed for unknown");
 
-    assert_eq!(client_result.response_code(), ResponseCode::NoError);
+    assert_eq!(client_result.metadata.response_code, ResponseCode::NoError);
     assert_eq!(
-        client_result.queries().first().unwrap().query_type(),
+        client_result.queries.first().unwrap().query_type,
         RecordType::Unknown(65535)
     );
-    assert!(client_result.answers().is_empty());
-    assert!(!client_result.authorities().is_empty());
+    assert!(client_result.answers.is_empty());
+    assert!(!client_result.authorities.is_empty());
     // SOA should be the first record in the response
     assert_eq!(
         client_result
-            .authorities()
+            .authorities
             .first()
             .expect("no SOA present")
             .record_type(),
@@ -142,16 +142,14 @@ async fn test_server_form_error_on_multiple_queries() {
     let client = lazy_udp_client(ipaddr).await;
 
     // build the message
-    let query_a = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
-    let query_aaaa = Query::query(
+    let query_a = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let query_aaaa = Query::new(
         Name::from_str("www.example.com.").unwrap(),
         RecordType::AAAA,
     );
     let mut message = Message::query();
-    message
-        .add_query(query_a)
-        .add_query(query_aaaa)
-        .set_recursion_desired(true);
+    message.metadata.recursion_desired = true;
+    message.add_query(query_a).add_query(query_aaaa);
 
     let mut client_result = client
         .send(DnsRequest::from(message))
@@ -162,7 +160,7 @@ async fn test_server_form_error_on_multiple_queries() {
     assert_eq!(client_result.len(), 1);
     let client_result = client_result.pop().expect("there should be one response");
 
-    assert_eq!(client_result.response_code(), ResponseCode::FormErr);
+    assert_eq!(client_result.metadata.response_code, ResponseCode::FormErr);
 
     server_continue.store(false, Ordering::Relaxed);
     server.await.unwrap();
@@ -184,7 +182,7 @@ async fn test_server_no_response_on_response() {
     let client = lazy_udp_client(ipaddr).await;
 
     // build the message
-    let query_a = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let query_a = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
     let mut message = Message::response(10, OpCode::Query);
     message.add_query(query_a);
 
@@ -313,19 +311,19 @@ async fn client_thread_www(future: impl Future<Output = Client<TokioRuntimeProvi
         .expect("error querying");
 
     assert_eq!(
-        response.response_code(),
+        response.metadata.response_code,
         ResponseCode::NoError,
         "got an error: {:?}",
-        response.response_code()
+        response.metadata.response_code
     );
-    assert!(response.header().authoritative());
+    assert!(response.metadata.authoritative);
 
-    let record = &response.answers()[0];
-    assert_eq!(record.name(), &name);
+    let record = &response.answers[0];
+    assert_eq!(record.name, name);
     assert_eq!(record.record_type(), RecordType::A);
-    assert_eq!(record.dns_class(), DNSClass::IN);
+    assert_eq!(record.dns_class, DNSClass::IN);
 
-    if let RData::A(address) = *record.data() {
+    if let RData::A(address) = record.data {
         assert_eq!(address, A::new(93, 184, 215, 14))
     } else {
         panic!();
@@ -356,7 +354,7 @@ async fn server_thread_udp(udp_socket: UdpSocket, server_continue: Arc<AtomicBoo
 async fn server_thread_tcp(tcp_listener: TcpListener, server_continue: Arc<AtomicBool>) {
     let catalog = new_catalog();
     let mut server = Server::new(catalog);
-    server.register_listener(tcp_listener, Duration::from_secs(30));
+    server.register_listener(tcp_listener, Duration::from_secs(30), 32);
 
     while server_continue.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -405,7 +403,7 @@ async fn edns_multiple_opt_rr() {
     let server = tokio::spawn(server_thread_udp(udp_socket, Arc::clone(&server_continue)));
 
     let mut message = Message::query();
-    message.add_query(Query::query(Name::root(), RecordType::NS));
+    message.add_query(Query::new(Name::root(), RecordType::NS));
     message.add_additional(Record::from_rdata(
         Name::root(),
         0,
@@ -433,8 +431,8 @@ async fn edns_multiple_opt_rr() {
     let response = Message::from_vec(&response_buf).unwrap();
 
     dbg!(&response);
-    assert_eq!(message.header().id(), response.header().id());
-    assert_eq!(response.response_code(), ResponseCode::FormErr);
+    assert_eq!(message.metadata.id, response.metadata.id);
+    assert_eq!(response.metadata.response_code, ResponseCode::FormErr);
 
     server_continue.store(false, Ordering::Relaxed);
     server.await.unwrap();

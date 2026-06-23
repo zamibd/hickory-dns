@@ -205,7 +205,7 @@ impl<R: ConnectionProvider> Resolver<R> {
             if self.context.options.ndots > 4 {
                 finally_ip_addr = Some(record);
             } else {
-                let query = Query::query(name, ip_addr.record_type());
+                let query = Query::new(name, ip_addr.record_type());
                 let lookup = Lookup::new_with_max_ttl(query, [record]);
                 return Ok(lookup.into());
             }
@@ -215,7 +215,7 @@ impl<R: ConnectionProvider> Resolver<R> {
             (Ok(name), _) => name,
             (Err(_), Some(ip_addr)) => {
                 // it was a valid IP, return that...
-                let query = Query::query(ip_addr.name().clone(), ip_addr.record_type());
+                let query = Query::new(ip_addr.name.clone(), ip_addr.record_type());
                 let lookup = Lookup::new_with_max_ttl(query, [ip_addr.clone()]);
                 return Ok(lookup.into());
             }
@@ -231,7 +231,7 @@ impl<R: ConnectionProvider> Resolver<R> {
             self.client_cache.clone(),
             self.request_options(),
             hosts,
-            finally_ip_addr.map(Record::into_data),
+            finally_ip_addr.map(|r| r.data),
         )
         .await
     }
@@ -249,7 +249,7 @@ impl<R: ConnectionProvider> Resolver<R> {
         };
 
         for name in self.build_names(name) {
-            let query = Query::query(name, record_type);
+            let query = Query::new(name, record_type);
             self.client_cache.clear_cache_query(&query);
         }
     }
@@ -351,6 +351,7 @@ impl<R: ConnectionProvider> Resolver<R> {
         let mut request_opts = DnsRequestOptions::default();
         request_opts.recursion_desired = self.context.options.recursion_desired;
         request_opts.use_edns = self.context.options.edns0;
+        request_opts.edns_payload_len = self.context.options.edns_payload_len;
         request_opts.case_randomization = self.context.options.case_randomization;
 
         // Set DNSSEC OK bit when DNSSEC validation is enabled
@@ -639,7 +640,7 @@ where
 
         let query = match name {
             Ok(name) => {
-                let query = Query::query(name, record_type);
+                let query = Query::new(name, record_type);
 
                 if let Some(lookup) = hosts.lookup_static_host(&query) {
                     future::ok(lookup).boxed()
@@ -692,7 +693,7 @@ where
                     // for that next name and continue looping.
                     self.query = self
                         .client_cache
-                        .lookup(Query::query(name, record_type), options)
+                        .lookup(Query::new(name, record_type), options)
                         .boxed();
                     // Continue looping with the new query. It will be polled
                     // on the next iteration of the loop.
@@ -846,7 +847,7 @@ pub(crate) mod testing {
                 .as_lookup()
                 .message()
                 .all_sections()
-                .any(|record| record.proof().is_secure())
+                .any(|record| record.proof.is_secure())
         );
     }
 
@@ -873,7 +874,7 @@ pub(crate) mod testing {
                 .collect::<Vec<_>>()
         );
         for record in lookup_ip.as_lookup().message().all_sections() {
-            assert!(record.proof().is_insecure());
+            assert!(record.proof.is_insecure());
         }
     }
 
@@ -1465,7 +1466,7 @@ mod tests {
             .unwrap()
             .answers()
             .iter()
-            .map(|r| r.data().ip_addr().unwrap())
+            .map(|r| r.data.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![Ipv4Addr::LOCALHOST]
         );
@@ -1474,19 +1475,18 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_slice() {
         assert_eq!(
-            Record::data(
-                &LookupFuture::lookup(
-                    vec![Name::root()],
-                    RecordType::A,
-                    DnsRequestOptions::default(),
-                    CachingClient::new(0, mock(vec![v4_message()]), false),
-                )
-                .await
-                .unwrap()
-                .answers()[0]
+            LookupFuture::lookup(
+                vec![Name::root()],
+                RecordType::A,
+                DnsRequestOptions::default(),
+                CachingClient::new(0, mock(vec![v4_message()]), false),
             )
-            .ip_addr()
-            .unwrap(),
+            .await
+            .unwrap()
+            .answers()[0]
+                .data
+                .ip_addr()
+                .unwrap(),
             Ipv4Addr::LOCALHOST
         );
     }
@@ -1504,7 +1504,7 @@ mod tests {
             .unwrap()
             .answers()
             .iter()
-            .map(|r| r.data().ip_addr().unwrap())
+            .map(|r| r.data.ip_addr().unwrap())
             .collect::<Vec<IpAddr>>(),
             vec![Ipv4Addr::LOCALHOST]
         );
@@ -1539,7 +1539,7 @@ mod tests {
             panic!("wrong error received");
         };
 
-        assert_eq!(*no_records.query, Query::query(Name::root(), RecordType::A));
+        assert_eq!(*no_records.query, Query::new(Name::root(), RecordType::A));
         assert_eq!(no_records.negative_ttl, None);
     }
 
@@ -1561,20 +1561,20 @@ mod tests {
 
     fn v4_message() -> Result<DnsResponse, NetError> {
         let mut message = Message::query();
-        message.add_query(Query::query(Name::root(), RecordType::A));
+        message.add_query(Query::new(Name::root(), RecordType::A));
         message.insert_answers(vec![Record::from_rdata(
             Name::root(),
             86400,
             RData::A(A::new(127, 0, 0, 1)),
         )]);
 
-        let resp = DnsResponse::from_message(message).unwrap();
+        let resp = DnsResponse::from_message(message.into_response()).unwrap();
         assert!(resp.contains_answer());
         Ok(resp)
     }
 
     fn empty() -> Result<DnsResponse, NetError> {
-        Ok(DnsResponse::from_message(Message::query()).unwrap())
+        Ok(DnsResponse::from_message(Message::query().into_response()).unwrap())
     }
 
     fn error() -> Result<DnsResponse, NetError> {

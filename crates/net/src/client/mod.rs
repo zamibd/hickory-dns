@@ -34,8 +34,8 @@ use crate::{
     proto::{
         ProtoError,
         op::{
-            DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message, OpCode, Query,
-            update_message,
+            DEFAULT_MAX_PAYLOAD_LEN, DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message,
+            OpCode, Query, update_message,
         },
         rr::{DNSClass, Name, RData, Record, RecordSet, RecordType, rdata::SOA},
     },
@@ -159,7 +159,7 @@ pub trait ClientHandle: 'static + Clone + DnsHandle + Send {
         query_class: DNSClass,
         query_type: RecordType,
     ) -> ClientResponse<<Self as DnsHandle>::Response> {
-        let mut query = Query::query(name, query_type);
+        let mut query = Query::new(name, query_type);
         query.set_query_class(query_class);
         let mut options = DnsRequestOptions::default();
         options.use_edns = self.is_using_edns();
@@ -240,26 +240,25 @@ pub trait ClientHandle: 'static + Clone + DnsHandle + Send {
 
         // build the message
         let mut message = Message::query();
-        message
-            // 3.3. NOTIFY is similar to QUERY in that it has a request message with
-            // the header QR flag "clear" and a response message with QR "set".  The
-            // response message contains no useful information, but its reception by
-            // the Primary is an indication that the Secondary has received the NOTIFY
-            // and that the Primary Zone Server can remove the Secondary from any retry queue for
-            // this NOTIFY event.
-            .set_op_code(OpCode::Notify);
+        // 3.3. NOTIFY is similar to QUERY in that it has a request message with
+        // the header QR flag "clear" and a response message with QR "set".  The
+        // response message contains no useful information, but its reception by
+        // the Primary is an indication that the Secondary has received the NOTIFY
+        // and that the Primary Zone Server can remove the Secondary from any retry queue for
+        // this NOTIFY event.
+        message.metadata.op_code = OpCode::Notify;
 
         // Extended dns
         if self.is_using_edns() {
             message
-                .extensions_mut()
+                .edns
                 .get_or_insert_with(Edns::new)
-                .set_max_payload(update_message::MAX_PAYLOAD_LEN)
+                .set_max_payload(DEFAULT_MAX_PAYLOAD_LEN)
                 .set_version(0);
         }
 
         // add the query
-        let mut query: Query = Query::new();
+        let mut query: Query = Query::root();
         query
             .set_name(name)
             .set_query_class(query_class)
@@ -515,7 +514,7 @@ pub trait ClientHandle: 'static + Clone + DnsHandle + Send {
         record: Record,
         zone_origin: Name,
     ) -> ClientResponse<<Self as DnsHandle>::Response> {
-        assert!(zone_origin.zone_of(record.name()));
+        assert!(zone_origin.zone_of(&record.name));
         let message = update_message::delete_rrset(record, zone_origin, self.is_using_edns());
         ClientResponse(self.send(DnsRequest::from(message)))
     }
@@ -680,8 +679,8 @@ impl<R> ClientStreamXfrState<R> {
     fn process(&mut self, answers: &[Record]) -> Result<(), NetError> {
         use ClientStreamXfrState::*;
         fn get_serial(r: &Record) -> Option<u32> {
-            match r.data() {
-                RData::SOA(soa) => Some(soa.serial()),
+            match &r.data {
+                RData::SOA(soa) => Some(soa.serial),
                 _ => None,
             }
         }
@@ -813,7 +812,7 @@ where
 
         let message = ready!(self.state.inner().poll_next_unpin(cx)).map(|response| {
             let ok = response?;
-            self.state.process(ok.answers())?;
+            self.state.process(&ok.answers)?;
             Ok(ok)
         });
         Poll::Ready(message)

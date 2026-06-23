@@ -13,21 +13,21 @@ use hickory_proto::{
         Algorithm, Verifier,
         rdata::{DNSKEY, DNSSECRData, RRSIG},
     },
-    op::{Header, MessageType, OpCode, Query},
+    op::{MessageRequest, MessageType, Metadata, OpCode, Query},
     rr::{DNSClass, Name, RData, Record, RecordType},
 };
 use hickory_server::{
     server::Request,
-    zone_handler::{DnssecZoneHandler, LookupOptions, MessageRequest, ZoneHandler},
+    zone_handler::{DnssecZoneHandler, LookupOptions, ZoneHandler},
 };
 
-const TEST_HEADER: &Header = &Header::new(10, MessageType::Query, OpCode::Query);
+const TEST_HEADER: &Metadata = &Metadata::new(10, MessageType::Query, OpCode::Query);
 
 pub fn test_a_lookup(handler: impl ZoneHandler, keys: &[DNSKEY]) {
     let request = Request::from_message(
         MessageRequest::mock(
             *TEST_HEADER,
-            Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A),
+            Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A),
         ),
         SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
@@ -68,20 +68,17 @@ pub fn test_soa(handler: impl ZoneHandler, keys: &[DNSKEY]) {
 
     assert_eq!(soa_records.len(), 1);
 
-    let Some(RData::SOA(soa)) = soa_records.first().map(|r| r.data()) else {
+    let Some(RData::SOA(soa)) = soa_records.first().map(|r| &r.data) else {
         panic!("expected SOA record");
     };
 
-    assert_eq!(Name::from_str("hickory-dns.org.").unwrap(), *soa.mname());
-    assert_eq!(
-        Name::from_str("root.hickory-dns.org.").unwrap(),
-        *soa.rname()
-    );
-    assert!(199609203 < soa.serial()); // serial should be one or more b/c of the signing process
-    assert_eq!(28800, soa.refresh());
-    assert_eq!(7200, soa.retry());
-    assert_eq!(604800, soa.expire());
-    assert_eq!(86400, soa.minimum());
+    assert_eq!(Name::from_str("hickory-dns.org.").unwrap(), soa.mname);
+    assert_eq!(Name::from_str("root.hickory-dns.org.").unwrap(), soa.rname);
+    assert!(199609203 < soa.serial); // serial should be one or more b/c of the signing process
+    assert_eq!(28800, soa.refresh);
+    assert_eq!(7200, soa.retry);
+    assert_eq!(604800, soa.expire);
+    assert_eq!(86400, soa.minimum);
 
     let rrsig_records: Vec<_> = other_records
         .into_iter()
@@ -109,7 +106,7 @@ pub fn test_ns(handler: impl ZoneHandler, keys: &[DNSKEY]) {
     assert_eq!(
         ns_records
             .first()
-            .and_then(|r| match r.data() {
+            .and_then(|r| match &r.data {
                 RData::NS(ns) => Some(&ns.0),
                 _ => None,
             })
@@ -131,7 +128,7 @@ pub fn test_aname_lookup(handler: impl ZoneHandler, keys: &[DNSKEY]) {
     let request = Request::from_message(
         MessageRequest::mock(
             *TEST_HEADER,
-            Query::query(
+            Query::new(
                 Name::from_str("aname-chain.example.com.").unwrap(),
                 RecordType::A,
             ),
@@ -164,7 +161,7 @@ pub fn test_wildcard(handler: impl ZoneHandler, keys: &[DNSKEY]) {
     let request = Request::from_message(
         MessageRequest::mock(
             *TEST_HEADER,
-            Query::query(
+            Query::new(
                 Name::from_str("www.wildcard.example.com.").unwrap(),
                 RecordType::CNAME,
             ),
@@ -185,7 +182,7 @@ pub fn test_wildcard(handler: impl ZoneHandler, keys: &[DNSKEY]) {
     assert!(
         cname_records
             .iter()
-            .all(|r| *r.name() == Name::from_str("www.wildcard.example.com.").unwrap())
+            .all(|r| r.name == Name::from_str("www.wildcard.example.com.").unwrap())
     );
 
     let rrsig_records: Vec<_> = other_records
@@ -203,7 +200,7 @@ pub fn test_wildcard_subdomain(handler: impl ZoneHandler, keys: &[DNSKEY]) {
     let request = Request::from_message(
         MessageRequest::mock(
             *TEST_HEADER,
-            Query::query(
+            Query::new(
                 Name::from_str("subdomain.www.wildcard.example.com.").unwrap(),
                 RecordType::CNAME,
             ),
@@ -224,7 +221,7 @@ pub fn test_wildcard_subdomain(handler: impl ZoneHandler, keys: &[DNSKEY]) {
     assert!(
         cname_records
             .iter()
-            .all(|r| *r.name() == Name::from_str("subdomain.www.wildcard.example.com.").unwrap())
+            .all(|r| r.name == Name::from_str("subdomain.www.wildcard.example.com.").unwrap())
     );
 
     let rrsig_records: Vec<_> = other_records
@@ -350,7 +347,7 @@ pub fn test_nsec_nxdomain_wraps_end(handler: impl ZoneHandler, _: &[DNSKEY]) {
 }
 
 pub fn verify(records: &[&Record], rrsig_records: &[Record<RRSIG>], keys: &[DNSKEY]) {
-    let record_name = records.first().unwrap().name();
+    let record_name = &records.first().unwrap().name;
     let record_type = records.first().unwrap().record_type();
     println!("record_name: {record_name}, type: {record_type}");
 
@@ -358,7 +355,7 @@ pub fn verify(records: &[&Record], rrsig_records: &[Record<RRSIG>], keys: &[DNSK
     assert!(keys.iter().all(|key| {
         rrsig_records
             .iter()
-            .map(|rrsig| rrsig.data())
+            .map(|rrsig| &rrsig.data)
             .filter(|rrsig| rrsig.input().algorithm == key.algorithm())
             .filter(|rrsig| rrsig.input().key_tag == key.calculate_key_tag().unwrap())
             .filter(|rrsig| rrsig.input().type_covered == record_type)

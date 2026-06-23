@@ -12,7 +12,7 @@ use alloc::string::{String, ToString};
 use core::cmp::{Ordering, PartialEq};
 use core::fmt;
 use core::hash::{Hash, Hasher};
-use core::ops::{Deref, DerefMut};
+use core::ops::Deref;
 use core::str::FromStr;
 
 use crate::error::*;
@@ -269,18 +269,11 @@ impl Deref for LowerName {
     }
 }
 
-impl DerefMut for LowerName {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 impl<'r> BinDecodable<'r> for LowerName {
-    /// parses the chain of labels
-    ///  this has a max of 255 octets, with each label being less than 63.
-    ///  all names will be stored lowercase internally.
-    /// This will consume the portions of the Vec which it is reading...
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    /// Parses a domain name and converts it to lowercase.
+    ///
+    /// The maximum length of a name is 255 octets, and the maximum length of each label is 63.
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let name = Name::read(decoder)?;
         Ok(Self(name.to_lowercase()))
     }

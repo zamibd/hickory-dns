@@ -27,12 +27,13 @@ default = ["sqlite", "resolver", "rustls-platform-verifier"]
 # if enabled, the hickory-dns binary will print ascii-art on start, disable to reduce the binary size
 ascii-art = []
 
+systemd = ["dep:sd-notify"]
 blocklist = ["hickory-server/blocklist"]
 recursor = ["hickory-server/recursor"]
 # Recursive Resolution is Experimental!
 resolver = ["hickory-server/resolver"]
 sqlite = ["hickory-server/sqlite", "dep:rusqlite"]
-prometheus-metrics = ["metrics", "dep:http", "dep:hyper", "dep:hyper-util", "dep:metrics-exporter-prometheus", "dep:tokio-util"]
+prometheus-metrics = ["metrics", "dep:http", "dep:hyper", "dep:hyper-util", "dep:metrics-exporter-prometheus", "dep:tokio-util", "dep:tower", "dep:tower-http"]
 metrics = ["hickory-server/metrics", "hickory-resolver/metrics", "dep:metrics", "dep:metrics-process"]
 
 tls-aws-lc-rs = ["hickory-server/tls-aws-lc-rs", "hickory-resolver/tls-aws-lc-rs", "__tls"]
@@ -51,6 +52,8 @@ dnssec-aws-lc-rs = ["hickory-server/dnssec-aws-lc-rs", "dep:rustls-pki-types", "
 dnssec-ring = ["hickory-server/dnssec-ring", "dep:rustls-pki-types", "__dnssec"]
 __dnssec = []
 
+jemalloc-profiling = ["jemalloc", "tikv-jemallocator/profiling"]
+jemalloc = ["dep:tikv-jemallocator"]
 webpki-roots = ["hickory-server/webpki-roots"]
 rustls-platform-verifier = ["hickory-server/rustls-platform-verifier"]
 
@@ -73,7 +76,7 @@ ipnet = { workspace = true, features = ["serde"] }
 # rusqlite is actually only needed for test situations, but we need an optional dependency
 # here so we can disable it for MSRV tests (rusqlite only supports latest stable)
 rusqlite = { workspace = true, features = ["bundled", "time"], optional = true }
-socket2.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
@@ -84,6 +87,8 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"]
 tokio = { workspace = true, features = ["time", "rt", "signal"] }
 tokio-util = { workspace = true, optional = true }
 toml.workspace = true
+tower = { workspace = true, features = ["util"], optional = true }
+tower-http = { workspace = true, features = ["compression-gzip"], optional = true }
 hex.workspace = true
 hickory-proto.workspace = true
 hickory-net.workspace = true
@@ -94,8 +99,12 @@ metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 metrics-process = { workspace = true, optional = true }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+sd-notify = { workspace = true, optional = true }
 
 [dev-dependencies]
 bytes.workspace = true
@@ -117,4 +126,4 @@ workspace = true
 [package.metadata.cargo-all-features]
 skip_optional_dependencies = true
 max_combination_size = 2
-denylist = ["__tls", "__https", "__quic", "__h3", "__dnssec"]
+denylist = ["__tls", "__https", "__quic", "__h3", "__dnssec", "systemd"]

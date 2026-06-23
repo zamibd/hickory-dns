@@ -53,7 +53,7 @@ where
         client: H,
     ) -> impl Stream<Item = Result<DnsResponse, NetError>> {
         // TODO: what if we want to support multiple queries (non-standard)?
-        let query = request.queries().first().expect("no query!").clone();
+        let query = request.queries.first().expect("no query!").clone();
 
         // lock all the currently running queries
         let mut active_queries = active_queries.lock().await;
@@ -122,11 +122,11 @@ mod test {
             let i = Arc::clone(&self.i);
             Box::pin(stream::once(async move {
                 let mut i = i.lock().await;
-                let message = Message::new(*i, MessageType::Query, OpCode::Query);
+                let message = Message::new(*i, MessageType::Query, OpCode::Query).into_response();
                 std::println!(
                     "sending {}: {}",
                     *i,
-                    request.queries().first().expect("no query!").clone()
+                    request.queries.first().expect("no query!").clone()
                 );
 
                 *i += 1;
@@ -147,22 +147,22 @@ mod test {
         });
 
         let mut test1 = Message::query();
-        test1.add_query(Query::new().set_query_type(RecordType::A).clone());
+        test1.add_query(Query::root().set_query_type(RecordType::A).clone());
 
         let mut test2 = Message::query();
-        test2.add_query(Query::new().set_query_type(RecordType::AAAA).clone());
+        test2.add_query(Query::root().set_query_type(RecordType::AAAA).clone());
 
         let result = block_on(client.send(DnsRequest::from(test1.clone())).first_answer()).unwrap();
-        assert_eq!(result.id(), 0);
+        assert_eq!(result.id, 0);
 
         let result = block_on(client.send(DnsRequest::from(test2.clone())).first_answer()).unwrap();
-        assert_eq!(result.id(), 1);
+        assert_eq!(result.id, 1);
 
         // should get the same result for each...
         let result = block_on(client.send(DnsRequest::from(test1)).first_answer()).unwrap();
-        assert_eq!(result.id(), 0);
+        assert_eq!(result.id, 0);
 
         let result = block_on(client.send(DnsRequest::from(test2)).first_answer()).unwrap();
-        assert_eq!(result.id(), 1);
+        assert_eq!(result.id, 1);
     }
 }

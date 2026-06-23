@@ -14,7 +14,7 @@
     clippy::std_instead_of_alloc,
     missing_docs
 )]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Hickory DNS Protocol library
 
@@ -54,7 +54,7 @@ mod no_std_rand {
 
     use critical_section::Mutex;
     use rand::distr::{Distribution, StandardUniform};
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     /// Generates a random value on `no_std`.
     ///

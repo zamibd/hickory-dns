@@ -8,33 +8,29 @@
 //! `DnsMultiplexer` and associated types implement the state machines for sending DNS messages while using the underlying streams.
 
 use core::{
-    marker::Unpin,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
 use std::collections::{HashMap, hash_map::Entry};
+use std::io;
 
 use futures_channel::mpsc;
 use futures_util::{
     FutureExt,
-    future::{BoxFuture, Future},
-    ready,
+    future::BoxFuture,
     stream::{Stream, StreamExt},
 };
-use rand::Rng;
+use rand::RngExt;
 use tracing::debug;
 
 use super::{
-    BufDnsStreamHandle, CHANNEL_BUFFER_SIZE, DnsClientStream, DnsRequestSender, DnsResponseStream,
-    ignore_send,
+    BufDnsStreamHandle, DnsClientStream, DnsRequestSender, DnsResponseStream, ignore_send,
 };
 use crate::proto::op::{DnsRequest, DnsResponse, SerialMessage};
 #[cfg(feature = "__dnssec")]
 use crate::proto::rr::{TSigVerifier, TSigner};
 use crate::{DnsStreamHandle, error::NetError, runtime::Time};
-
-const QOS_MAX_RECEIVE_MSGS: usize = 100; // max number of messages to receive from the UDP socket
 
 struct ActiveRequest {
     // the completion is the channel for a response to the original request
@@ -94,13 +90,18 @@ pub struct DnsMultiplexer<S> {
     timeout_duration: Duration,
     stream_handle: BufDnsStreamHandle,
     active_requests: HashMap<u16, ActiveRequest>,
+    max_active_requests: usize,
     #[cfg(feature = "__dnssec")]
     signer: Option<TSigner>,
     is_shutdown: bool,
 }
 
 impl<S: DnsClientStream> DnsMultiplexer<S> {
-    /// Spawns a new DnsMultiplexer Stream. This uses a default timeout of 5 seconds for all requests.
+    /// Spawns a new DnsMultiplexer Stream.
+    ///
+    /// This uses a default timeout of 5 seconds for all requests unless changed with
+    /// [`Self::with_timeout()`]. At most 32 in-flight requests are allowed unless
+    /// changed with [`Self::with_max_active_requests()`].
     ///
     /// # Arguments
     ///
@@ -113,6 +114,7 @@ impl<S: DnsClientStream> DnsMultiplexer<S> {
             timeout_duration: Duration::from_secs(5),
             stream_handle,
             active_requests: HashMap::default(),
+            max_active_requests: 32,
             #[cfg(feature = "__dnssec")]
             signer: None,
             is_shutdown: false,
@@ -122,6 +124,16 @@ impl<S: DnsClientStream> DnsMultiplexer<S> {
     /// Change the default timeout of the DnsMultiplexer stream.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout_duration = timeout;
+        self
+    }
+
+    /// Set the maximum number of active (in-flight) requests.
+    ///
+    /// This limits how many DNS queries can be simultaneously pending on this
+    /// multiplexed connection. When the limit is reached, new requests will
+    /// return [`NetError::Busy`].
+    pub fn with_max_active_requests(mut self, max: usize) -> Self {
+        self.max_active_requests = max;
         self
     }
 
@@ -187,52 +199,13 @@ impl<S: DnsClientStream> DnsMultiplexer<S> {
     }
 }
 
-/// A wrapper for a future DnsExchange connection
-#[must_use = "futures do nothing unless polled"]
-pub struct DnsMultiplexerConnect<F, S>
-where
-    F: Future<Output = Result<S, NetError>> + Send + Unpin + 'static,
-    S: Stream<Item = Result<SerialMessage, NetError>> + Unpin,
-{
-    stream: F,
-    stream_handle: Option<BufDnsStreamHandle>,
-    timeout_duration: Duration,
-    #[cfg(feature = "__dnssec")]
-    signer: Option<TSigner>,
-}
-
-impl<F, S> Future for DnsMultiplexerConnect<F, S>
-where
-    F: Future<Output = Result<S, NetError>> + Send + Unpin + 'static,
-    S: DnsClientStream,
-{
-    type Output = Result<DnsMultiplexer<S>, NetError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let stream: S = ready!(self.stream.poll_unpin(cx))?;
-
-        Poll::Ready(Ok(DnsMultiplexer {
-            stream,
-            timeout_duration: self.timeout_duration,
-            stream_handle: self
-                .stream_handle
-                .take()
-                .expect("must not poll after complete"),
-            active_requests: HashMap::new(),
-            #[cfg(feature = "__dnssec")]
-            signer: self.signer.clone(),
-            is_shutdown: false,
-        }))
-    }
-}
-
 impl<S: DnsClientStream> DnsRequestSender for DnsMultiplexer<S> {
     fn send_message(&mut self, request: DnsRequest) -> DnsResponseStream {
         if self.is_shutdown {
             panic!("can not send messages after stream is shutdown")
         }
 
-        if self.active_requests.len() > CHANNEL_BUFFER_SIZE {
+        if self.active_requests.len() >= self.max_active_requests {
             return NetError::Busy.into();
         }
 
@@ -242,7 +215,7 @@ impl<S: DnsClientStream> DnsRequestSender for DnsMultiplexer<S> {
         };
 
         let (mut request, _) = request.into_parts();
-        request.set_id(query_id);
+        request.metadata.id = query_id;
 
         #[cfg(feature = "__dnssec")]
         let mut verifier = None;
@@ -262,12 +235,12 @@ impl<S: DnsClientStream> DnsRequestSender for DnsMultiplexer<S> {
         // store a Timeout for this message before sending
         let timeout = S::Time::delay_for(self.timeout_duration);
 
-        let (complete, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let (complete, receiver) = mpsc::channel(QUERY_RESPONSE_BUFFER_SIZE);
 
         // send the message
         let active_request = ActiveRequest::new(
             complete,
-            request.id(),
+            request.id,
             timeout,
             #[cfg(feature = "__dnssec")]
             verifier,
@@ -340,7 +313,7 @@ impl<S: DnsClientStream> Stream for DnsMultiplexer<S> {
 
                     //   deserialize or log decode_error
                     match DnsResponse::from_buffer(buffer.into_parts().0) {
-                        Ok(response) => match self.active_requests.entry(response.id()) {
+                        Ok(response) => match self.active_requests.entry(response.id) {
                             Entry::Occupied(mut request_entry) => {
                                 // send the response, complete the request...
                                 let active_request = request_entry.get_mut();
@@ -359,7 +332,7 @@ impl<S: DnsClientStream> Stream for DnsMultiplexer<S> {
                                 #[cfg(not(feature = "__dnssec"))]
                                 ignore_send(active_request.completion.try_send(Ok(response)));
                             }
-                            Entry::Vacant(..) => debug!("unexpected request_id: {}", response.id()),
+                            Entry::Vacant(..) => debug!("unexpected request_id: {}", response.id),
                         },
                         // TODO: return src address for diagnostics
                         Err(error) => debug!(%error, "error decoding message"),
@@ -368,7 +341,10 @@ impl<S: DnsClientStream> Stream for DnsMultiplexer<S> {
                 Poll::Ready(err) => {
                     let err = match err {
                         Some(Err(e)) => e,
-                        None => NetError::from("stream closed"),
+                        None => NetError::from(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "stream closed",
+                        )),
                         _ => unreachable!(),
                     };
 
@@ -393,12 +369,21 @@ impl<S: DnsClientStream> Stream for DnsMultiplexer<S> {
     }
 }
 
+const QOS_MAX_RECEIVE_MSGS: usize = 100; // max number of messages to receive from the UDP socket
+
+/// Buffer size for per-query response channels.
+///
+/// Each outgoing DNS query gets its own channel to receive responses. Standard
+/// DNS queries receive exactly one response so a small buffer is sufficient.
+const QUERY_RESPONSE_BUFFER_SIZE: usize = 8;
+
 #[cfg(test)]
 mod test {
     use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use futures_util::{
         future::{self, BoxFuture},
+        ready,
         stream::TryStreamExt,
     };
     use test_support::subscribe;
@@ -406,8 +391,7 @@ mod test {
     use super::*;
     use crate::proto::op::{DnsRequestOptions, Message, Query};
     use crate::proto::rr::rdata::{NS, SOA};
-    use crate::proto::rr::record_type::RecordType;
-    use crate::proto::rr::{DNSClass, Name, RData, Record};
+    use crate::proto::rr::{DNSClass, Name, RData, Record, RecordType};
     use crate::proto::serialize::binary::BinEncodable;
     use crate::xfer::{DnsClientStream, StreamReceiver};
 
@@ -447,12 +431,12 @@ mod test {
                         .poll_next_unpin(cx)
                 );
                 let message = serial.unwrap().to_message().unwrap();
-                self.id = Some(message.id());
-                message.id()
+                self.id = Some(message.id);
+                message.id
             };
 
             if let Some(mut message) = self.messages.pop() {
-                message.set_id(id);
+                message.metadata.id = id;
                 Poll::Ready(Some(Ok(SerialMessage::new(
                     message.to_bytes().unwrap(),
                     self.addr,
@@ -488,27 +472,23 @@ mod test {
     fn a_query_answer() -> (DnsRequest, Vec<Message>) {
         let name = Name::from_ascii("www.example.com.").unwrap();
 
-        let mut msg = Message::query();
-        msg.add_query({
-            let mut query = Query::query(name.clone(), RecordType::A);
-            query.set_query_class(DNSClass::IN);
-            query
-        })
-        .set_recursion_desired(true);
+        let mut request = Message::query();
+        request.metadata.recursion_desired = true;
+        request.add_query({
+            let mut q = Query::new(name.clone(), RecordType::A);
+            q.set_query_class(DNSClass::IN);
+            q
+        });
 
-        let mut response = msg.to_response();
-        response.add_answer(
-            Record::from_rdata(
-                name,
-                86400,
-                RData::A(Ipv4Addr::new(93, 184, 215, 14).into()),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone(),
-        );
+        let mut response = request.clone().into_response();
+        response.add_answer(Record::from_rdata(
+            name,
+            86400,
+            RData::A(Ipv4Addr::new(93, 184, 215, 14).into()),
+        ));
         (
-            DnsRequest::new(response, DnsRequestOptions::default()),
-            vec![msg],
+            DnsRequest::new(request, DnsRequestOptions::default()),
+            vec![response],
         )
     }
 
@@ -516,12 +496,12 @@ mod test {
         let name = Name::from_ascii("example.com.").unwrap();
 
         let mut msg = Message::query();
+        msg.metadata.recursion_desired = true;
         msg.add_query({
-            let mut query = Query::query(name, RecordType::AXFR);
+            let mut query = Query::new(name, RecordType::AXFR);
             query.set_query_class(DNSClass::IN);
             query
-        })
-        .set_recursion_desired(true);
+        });
         msg
     }
 
@@ -539,9 +519,7 @@ mod test {
                 1209600,
                 3600,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone();
+        );
 
         vec![
             soa.clone(),
@@ -549,23 +527,17 @@ mod test {
                 origin.clone(),
                 86400,
                 RData::NS(NS(Name::parse("a.iana-servers.net.", None).unwrap())),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+            ),
             Record::from_rdata(
                 origin.clone(),
                 86400,
                 RData::NS(NS(Name::parse("b.iana-servers.net.", None).unwrap())),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+            ),
             Record::from_rdata(
                 origin.clone(),
                 86400,
                 RData::A(Ipv4Addr::new(93, 184, 215, 14).into()),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+            ),
             Record::from_rdata(
                 origin,
                 86400,
@@ -575,9 +547,7 @@ mod test {
                     )
                     .into(),
                 ),
-            )
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+            ),
             soa,
         ]
     }
@@ -585,7 +555,7 @@ mod test {
     fn axfr_query_answer() -> (DnsRequest, Vec<Message>) {
         let msg = axfr_query();
 
-        let mut response = msg.to_response();
+        let mut response = msg.clone().into_response();
         response.insert_answers(axfr_response());
         (
             DnsRequest::new(msg, DnsRequestOptions::default()),
@@ -599,9 +569,9 @@ mod test {
         let query = base.clone();
         let mut rr = axfr_response();
         let rr2 = rr.split_off(3);
-        let mut msg1 = base.to_response();
+        let mut msg1 = base.clone().into_response();
         msg1.insert_answers(rr);
-        let mut msg2 = base.to_response();
+        let mut msg2 = base.into_response();
         msg2.insert_answers(rr2);
         (
             DnsRequest::new(query, DnsRequestOptions::default()),
@@ -639,7 +609,7 @@ mod test {
             r = response.try_collect::<Vec<_>>() => r.unwrap(),
         };
         assert_eq!(response.len(), 1);
-        assert_eq!(response[0].answers().len(), axfr_response().len());
+        assert_eq!(response[0].answers.len(), axfr_response().len());
     }
 
     #[tokio::test]
@@ -657,7 +627,7 @@ mod test {
         };
         assert_eq!(response.len(), 2);
         assert_eq!(
-            response.iter().map(|m| m.answers().len()).sum::<usize>(),
+            response.iter().map(|m| m.answers.len()).sum::<usize>(),
             axfr_response().len()
         );
     }

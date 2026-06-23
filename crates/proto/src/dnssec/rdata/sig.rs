@@ -19,7 +19,8 @@ use crate::{
     error::{ProtoError, ProtoResult},
     rr::{Name, RData, RecordData, RecordDataDecodable, RecordSet, RecordType, SerialNumber},
     serialize::binary::{
-        BinDecodable, BinDecoder, BinEncodable, BinEncoder, RDataEncoding, Restrict, RestrictedMath,
+        BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, RDataEncoding, Restrict,
+        RestrictedMath,
     },
 };
 
@@ -250,13 +251,13 @@ impl BinEncodable for SIG {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         let mut encoder = encoder.with_rdata_behavior(RDataEncoding::Canonical);
         self.input.emit(&mut encoder)?;
-        encoder.emit_vec(&self.sig)?;
+        encoder.emit_slice(&self.sig)?;
         Ok(())
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for SIG {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         let start_idx = decoder.index();
 
         // TODO should we verify here? or elsewhere...
@@ -288,7 +289,7 @@ impl<'r> RecordDataDecodable<'r> for SIG {
         let sig_len = length
         .map(|u| u as usize)
         .checked_sub(decoder.index() - start_idx)
-        .map_err(|_| ProtoError::from("invalid rdata length in SIG"))?
+        .map_err(|len| DecodeError::IncorrectRDataLengthRead { read: decoder.index() - start_idx, len })?
         .unverified(/*used only as length safely*/);
         let sig = decoder
         .read_vec(sig_len)?
@@ -428,11 +429,11 @@ impl BinEncodable for SigInput {
         // specifically for outputting the RData for an RRSIG, with signer_name in canonical form
         self.type_covered.emit(&mut encoder)?;
         self.algorithm.emit(&mut encoder)?;
-        encoder.emit(self.num_labels)?;
-        encoder.emit_u32(self.original_ttl)?;
-        encoder.emit_u32(self.sig_expiration.0)?;
-        encoder.emit_u32(self.sig_inception.0)?;
-        encoder.emit_u16(self.key_tag)?;
+        self.num_labels.emit(&mut encoder)?;
+        self.original_ttl.emit(&mut encoder)?;
+        self.sig_expiration.0.emit(&mut encoder)?;
+        self.sig_inception.0.emit(&mut encoder)?;
+        self.key_tag.emit(&mut encoder)?;
         self.signer_name.emit(&mut encoder)?;
         Ok(())
     }

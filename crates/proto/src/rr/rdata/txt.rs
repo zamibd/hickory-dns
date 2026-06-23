@@ -6,9 +6,12 @@
 // copied, modified, or distributed except according to those terms.
 
 //! text records for storing arbitrary data
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::fmt;
-use core::slice::Iter;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -16,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::*,
+    serialize::{binary::*, txt::ParseError},
 };
 
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
@@ -34,8 +37,12 @@ use crate::{
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct TXT {
-    txt_data: Box<[Box<[u8]>]>,
+    /// ```text
+    /// TXT-DATA        One or more <character-string>s.
+    /// ```
+    pub txt_data: Box<[Box<[u8]>]>,
 }
 
 impl TXT {
@@ -78,22 +85,19 @@ impl TXT {
         }
     }
 
-    /// ```text
-    /// TXT-DATA        One or more <character-string>s.
-    /// ```
-    pub fn txt_data(&self) -> &[Box<[u8]>] {
-        &self.txt_data
-    }
-
-    /// Returns an iterator over the arrays in the txt data
-    pub fn iter(&self) -> Iter<'_, Box<[u8]>> {
-        self.txt_data.iter()
+    /// Parse the RData from a set of Tokens
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        tokens: I,
+    ) -> Result<Self, ParseError> {
+        let txt_data = tokens.map(ToString::to_string).collect::<Vec<_>>();
+        Ok(Self::new(txt_data))
     }
 }
 
 impl BinEncodable for TXT {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        for s in self.txt_data() {
+        for s in &self.txt_data {
             encoder.emit_character_data(s)?;
         }
 
@@ -102,7 +106,10 @@ impl BinEncodable for TXT {
 }
 
 impl RecordDataDecodable<'_> for TXT {
-    fn read_data(decoder: &mut BinDecoder<'_>, rdata_length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(
+        decoder: &mut BinDecoder<'_>,
+        rdata_length: Restrict<u16>,
+    ) -> Result<Self, DecodeError> {
         let data_len = decoder.len();
         let mut strings = Vec::with_capacity(1);
 

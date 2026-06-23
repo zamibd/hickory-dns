@@ -11,12 +11,14 @@ use core::{
     clone::Clone,
     fmt::Display,
     hash::{Hash, Hasher},
+    mem,
     ops::RangeInclusive,
     pin::Pin,
     time::Duration,
 };
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    collections::{HashMap, hash_map::DefaultHasher},
+    ops::{Deref, DerefMut},
     sync::Arc,
     time::Instant,
 };
@@ -39,7 +41,9 @@ use crate::{
         op::{
             DnsRequest, DnsRequestOptions, DnsResponse, Edns, Message, OpCode, Query, ResponseCode,
         },
-        rr::{Name, RData, Record, RecordType, SerialNumber, resource::RecordRef},
+        rr::{
+            DNSClass, LowerName, Name, RData, Record, RecordRef, RecordType, RrKey, SerialNumber,
+        },
     },
     runtime::{RuntimeProvider, Time},
     xfer::{FirstAnswer, dns_handle::DnsHandle},
@@ -50,8 +54,6 @@ pub use error::{ProofError, ProofErrorKind};
 
 mod nsec3;
 use nsec3::verify_nsec3;
-
-use self::rrset::Rrset;
 
 /// Performs DNSSEC validation of all DNS responses from the wrapped DnsHandle
 ///
@@ -175,7 +177,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 debug!("translating NoRecordsFound to DnsResponse for {query}");
                 let mut msg = Message::query();
                 msg.add_query(*query);
-                msg.set_response_code(response_code);
+                msg.metadata.response_code = response_code;
 
                 if let Some(authorities) = authorities {
                     for record in authorities.iter() {
@@ -183,7 +185,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                     }
                 }
 
-                match DnsResponse::from_message(msg) {
+                match DnsResponse::from_message(msg.into_response()) {
                     Ok(response) => response,
                     Err(err) => {
                         return Err(NetError::from(format!(
@@ -197,18 +199,24 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
 
         debug!(
             "validating message_response: {}, with {} trust_anchors",
-            message.id(),
+            message.id,
             self.trust_anchor.len(),
         );
 
-        // use the same current time value for all rrsig + rrset pairs.
+        // Use the same current time value for all rrsig + rrset pairs.
         let current_time = <H::Runtime as RuntimeProvider>::Timer::current_time() as u32;
 
-        // group the record sets by name and type
-        //  each rrset type needs to validated independently
-        let answers = message.take_answers();
-        let authorities = message.take_authorities();
-        let additionals = message.take_additionals();
+        // Group the record sets by name and type.
+        // Each rrset type needs to validated independently.
+        let Message {
+            answers,
+            authorities,
+            additionals,
+            ..
+        } = &mut *message;
+        let answers = RrsetMap::new(answers);
+        let authorities = RrsetMap::new(authorities);
+        let additionals = RrsetMap::new(additionals);
 
         let answers = self
             .verify_rrsets(&query, answers, options, current_time)
@@ -216,43 +224,41 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         let authorities = self
             .verify_rrsets(&query, authorities, options, current_time)
             .await;
-        let additionals = self
-            .verify_rrsets(&query, additionals, options, current_time)
+        self.verify_rrsets(&query, additionals, options, current_time)
             .await;
 
         // If we have any wildcard records, they must be validated with covering
         // NSEC/NSEC3 records.  RFC 4035 5.3.4, 5.4, and RFC 5155 7.2.6.
-        let must_validate_nsec = answers.iter().any(|rr| match rr.data() {
-            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
-                rrsig.input().num_labels < rr.name().num_labels()
+        let must_validate_nsec = answers.iter().any(|(_, rrset)| match rrset.outcome {
+            RrsigVerificationOutcome::Secure { owner, rrsig } => {
+                rrsig.input().num_labels < owner.num_labels()
             }
-            _ => false,
+            // If the zone is insecure, we don't need to finish validation of wildcard expansion. If
+            // the RRset's signature is bogus, we likewise don't need to further check the wildcard
+            // expansion proof.
+            RrsigVerificationOutcome::Insecure | RrsigVerificationOutcome::Bogus => false,
         });
 
-        message.insert_answers(answers);
-        message.insert_authorities(authorities);
-        message.insert_additionals(additionals);
-
-        if !message.authorities().is_empty()
-            && message
-                .authorities()
-                .iter()
-                .all(|x| x.proof() == Proof::Insecure)
+        if !authorities.is_empty()
+            && authorities.iter().all(|(_, rrset)| {
+                rrset.records.iter().all(|x| x.proof == Proof::Insecure)
+                    && rrset.signatures.iter().all(|x| x.proof == Proof::Insecure)
+            })
         {
             return Ok(message);
         }
 
         let nsec3s = message
-            .authorities()
+            .authorities
             .iter()
             .filter_map(|rr| {
                 if message
-                    .authorities()
+                    .authorities
                     .iter()
-                    .any(|r| r.name() == rr.name() && r.proof() == Proof::Secure)
+                    .any(|r| r.name == rr.name && r.proof == Proof::Secure)
                 {
-                    match rr.data() {
-                        RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some((rr.name(), nsec3)),
+                    match &rr.data {
+                        RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some((&rr.name, nsec3)),
                         _ => None,
                     }
                 } else {
@@ -262,16 +268,16 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             .collect::<Vec<_>>();
 
         let nsecs = message
-            .authorities()
+            .authorities
             .iter()
             .filter_map(|rr| {
                 if message
-                    .authorities()
+                    .authorities
                     .iter()
-                    .any(|r| r.name() == rr.name() && r.proof() == Proof::Secure)
+                    .any(|r| r.name == rr.name && r.proof == Proof::Secure)
                 {
-                    match rr.data() {
-                        RData::DNSSEC(DNSSECRData::NSEC(nsec)) => Some((rr.name(), nsec)),
+                    match &rr.data {
+                        RData::DNSSEC(DNSSECRData::NSEC(nsec)) => Some((&rr.name, nsec)),
                         _ => None,
                     }
                 } else {
@@ -287,8 +293,8 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             (true, false, _) => verify_nsec3(
                 &query,
                 find_soa_name(&message),
-                message.response_code(),
-                message.answers(),
+                message.response_code,
+                &message.answers,
                 &nsec3s,
                 self.nsec3_soft_iteration_limit,
                 self.nsec3_hard_iteration_limit,
@@ -296,9 +302,9 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             (false, true, _) => verify_nsec(
                 &query,
                 find_soa_name(&message),
-                message.response_code(),
-                message.answers(),
-                nsecs.as_slice(),
+                message.response_code,
+                &message.answers,
+                &nsecs,
             ),
             (true, true, _) => {
                 warn!(
@@ -312,12 +318,26 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             }
             (false, false, false) => {
                 // Return Ok if there were no NSEC/NSEC3 records and no wildcard RRSIGs.
-                if !message.answers().is_empty() {
+                if !message.answers.is_empty() {
                     return Ok(message);
                 }
 
-                // Return Ok if the zone is insecure
-                if let Err(err) = self.find_ds_records(query.name().clone(), options).await {
+                // Calling find_ds_records for a DS query will cause a validation loop if the zone being
+                // queried is insecure and its parent zone is insecure (no DS records will exist and no
+                // NSEC records will be available to prove that non-existence.)  Return ok/insecure:
+                //
+                // * If the query type is DS *and* the parent zone is Insecure
+                // * For other query types, if the queried name is provably Insecure
+                if let Err(err) = self
+                    .find_ds_records(
+                        match query.query_type {
+                            RecordType::DS => query.name.base_name(),
+                            _ => query.name.clone(),
+                        },
+                        options,
+                    )
+                    .await
+                {
                     if err.proof == Proof::Insecure {
                         return Ok(message);
                     }
@@ -333,7 +353,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         };
 
         if !nsec_proof.is_secure() {
-            debug!("returning Nsec error for {} {nsec_proof}", query.name());
+            debug!("returning Nsec error for {} {nsec_proof}", query.name);
             // TODO change this to remove the NSECs, like we do for the others?
             return Err(NetError::from(DnsError::Nsec {
                 query: Box::new(query.clone()),
@@ -345,198 +365,87 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         Ok(message)
     }
 
-    /// This pulls all answers returned in a Message response and returns a future which will
-    ///  validate all of them.
-    async fn verify_rrsets(
+    /// Validates signatures over record sets.
+    async fn verify_rrsets<'a>(
         &self,
         query: &Query,
-        records: Vec<Record>,
+        rrsets: RrsetMap<'a>,
         options: DnsRequestOptions,
         current_time: u32,
-    ) -> Vec<Record> {
-        let mut rrset_types: HashSet<(Name, RecordType)> = HashSet::new();
+    ) -> VerifiedRrsetMap<'a> {
+        // There were no records to verify.
+        if rrsets.is_empty() {
+            return VerifiedRrsetMap(HashMap::new());
+        }
 
-        for rrset in records
-            .iter()
-            .filter(|rr| {
-                rr.record_type() != RecordType::RRSIG &&
-                // if we are at a depth greater than 1, we are only interested in proving evaluation chains
-                //   this means that only DNSKEY, DS, NSEC, and NSEC3 are interesting at that point.
-                //   this protects against looping over things like NS records and DNSKEYs in responses.
+        let mut map = HashMap::with_capacity(rrsets.len());
+        for (key, rrset) in rrsets.0.into_iter() {
+            let name = &key.name;
+            let record_type = key.record_type;
+
+            if self.request_depth > 1
+                && !matches!(
+                    key.record_type,
+                    RecordType::DNSKEY | RecordType::DS | RecordType::NSEC | RecordType::NSEC3
+                )
+            {
+                // If we are at a depth greater than 1, we are only interested in proving evaluation chains.
+                // This means that only DNSKEY, DS, NSEC, and NSEC3 are interesting at that point.
+                // This protects against looping over things like NS records and DNSKEYs in responses.
                 // TODO: is there a cleaner way to prevent cycles in the evaluations?
-                (self.request_depth <= 1 || matches!(
-                    rr.record_type(),
-                    RecordType::DNSKEY | RecordType::DS | RecordType::NSEC | RecordType::NSEC3,
-                ))
-            })
-            .map(|rr| (rr.name().clone(), rr.record_type()))
-        {
-            rrset_types.insert(rrset);
-        }
-
-        // there were no records to verify
-        if rrset_types.is_empty() {
-            return records;
-        }
-
-        // Records for return, eventually, all records will be returned in here
-        let mut return_records = Vec::with_capacity(records.len());
-
-        // Removing the RRSIGs from the original records, the rest of the records will be mutable to remove those evaluated
-        //    and the remainder after all evalutions will be returned.
-        let (mut rrsigs, mut records) = records
-            .into_iter()
-            .partition::<Vec<_>, _>(|r| r.record_type().is_rrsig());
-
-        for (name, record_type) in rrset_types {
-            // collect all the rrsets to verify
-            let current_rrset;
-            (current_rrset, records) = records
-                .into_iter()
-                .partition::<Vec<_>, _>(|rr| rr.record_type() == record_type && rr.name() == &name);
-
-            let current_rrsigs;
-            (current_rrsigs, rrsigs) = rrsigs.into_iter().partition::<Vec<_>, _>(|rr| {
-                rr.try_borrow::<RRSIG>()
-                    .map(|rr| rr.name() == &name && rr.data().input().type_covered == record_type)
-                    .unwrap_or_default()
-            });
-
-            // TODO: we can do a better job here, no need for all the vec creation and clones in the Rrset.
-            let mut rrs_to_verify = current_rrset.iter();
-            let mut rrset = Rrset::new(rrs_to_verify.next().unwrap());
-            rrs_to_verify.for_each(|rr| rrset.add(rr));
-
-            // RRSIGS are never modified after this point
-            let rrsigs: Vec<_> = current_rrsigs
-                .iter()
-                .filter_map(|rr| rr.try_borrow::<RRSIG>())
-                .filter(|rr| rr.name() == &name)
-                .filter(|rrsig| rrsig.data().input().type_covered == record_type)
-                .collect();
-
-            // if there is already an active validation going on, assume the other validation will
-            //  complete properly or error if it is invalid
+                continue;
+            }
 
             // TODO: support non-IN classes?
             debug!(
                 "verifying: {name} record_type: {record_type}, rrsigs: {rrsig_len}",
-                rrsig_len = rrsigs.len()
+                rrsig_len = rrset.signatures.len()
             );
 
             // verify this rrset
-            let proof = self
-                .verify_rrset(RrsetVerificationContext {
-                    query,
-                    rrset: &rrset,
-                    rrsigs,
-                    options,
-                    current_time,
-                })
-                .await;
+            let context = RrsetVerificationContext {
+                query,
+                key: &key,
+                rrset: &rrset,
+                options,
+                current_time,
+            };
 
-            let proof = match proof {
-                Ok(proof) => {
-                    debug!("verified: {name} record_type: {record_type}",);
+            let cache_key = context.key();
+            let result = match self.validation_cache.get(&cache_key, &context) {
+                Some(cached) => cached,
+                None => {
+                    // Generally, the RRSET will be validated by `verify_default_rrset()`. There are additional
+                    //  checks that happen after the RRSET is successfully validated. In the case of DNSKEYs this
+                    //  triggers `verify_dnskey_rrset()`. If it's an NSEC record, then the NSEC record will be
+                    //  validated to prove it's correctness. There is a special case for DNSKEY, where if the RRSET
+                    //  is unsigned, `rrsigs` is empty, then an immediate `verify_dnskey_rrset()` is triggered. In
+                    //  this case, it's possible the DNSKEY is a trust_anchor and is not self-signed.
+                    let proof = match context.key.record_type {
+                        RecordType::DNSKEY => self.verify_dnskey_rrset(&context).await,
+                        _ => self.verify_default_rrset(&context).await,
+                    };
+
+                    match &proof {
+                        // These could be transient errors that should be retried.
+                        Err(e) if matches!(e.kind(), ProofErrorKind::Net { .. }) => {
+                            debug!("not caching DNSSEC validation with ProofErrorKind::Net")
+                        }
+                        _ => {
+                            self.validation_cache
+                                .insert(proof.clone(), cache_key, &context);
+                        }
+                    }
+
                     proof
-                }
-                Err(err) => {
-                    match err.kind() {
-                        ProofErrorKind::DsResponseNsec { .. } => {
-                            debug!("verified insecure {name}/{record_type}")
-                        }
-                        kind => {
-                            debug!("failed to verify: {name} record_type: {record_type}: {kind}")
-                        }
-                    }
-                    RrsetProof {
-                        proof: err.proof,
-                        adjusted_ttl: None,
-                        rrsig_index: None,
-                    }
                 }
             };
 
-            let RrsetProof {
-                proof,
-                adjusted_ttl,
-                rrsig_index: rrsig_idx,
-            } = proof;
-            for mut record in current_rrset {
-                record.set_proof(proof);
-                if let (Proof::Secure, Some(ttl)) = (proof, adjusted_ttl) {
-                    record.set_ttl(ttl);
-                }
-
-                return_records.push(record);
-            }
-
-            // only mark the RRSIG used for the proof
-            let mut current_rrsigs = current_rrsigs;
-            if let Some(rrsig_idx) = rrsig_idx {
-                if let Some(rrsig) = current_rrsigs.get_mut(rrsig_idx) {
-                    rrsig.set_proof(proof);
-                    if let (Proof::Secure, Some(ttl)) = (proof, adjusted_ttl) {
-                        rrsig.set_ttl(ttl);
-                    }
-                } else {
-                    warn!(
-                        "bad rrsig index {rrsig_idx} rrsigs.len = {}",
-                        current_rrsigs.len()
-                    );
-                }
-            }
-
-            // push all the RRSIGs back to the return
-            return_records.extend(current_rrsigs);
+            let verified = VerifiedRrset::update_rrset(result, name, record_type, rrset);
+            map.insert(key, verified);
         }
 
-        // Add back all the RRSIGs and any records that were not verified
-        return_records.extend(rrsigs);
-        return_records.extend(records);
-        return_records
-    }
-
-    /// Generic entrypoint to verify any RRSET against the provided signatures.
-    ///
-    /// Generally, the RRSET will be validated by `verify_default_rrset()`. There are additional
-    ///  checks that happen after the RRSET is successfully validated. In the case of DNSKEYs this
-    ///  triggers `verify_dnskey_rrset()`. If it's an NSEC record, then the NSEC record will be
-    ///  validated to prove it's correctness. There is a special case for DNSKEY, where if the RRSET
-    ///  is unsigned, `rrsigs` is empty, then an immediate `verify_dnskey_rrset()` is triggered. In
-    ///  this case, it's possible the DNSKEY is a trust_anchor and is not self-signed.
-    ///
-    /// # Returns
-    ///
-    /// If Ok, returns an RrsetProof containing the proof, adjusted TTL, and an index of the RRSIG used for
-    /// validation of the rrset.
-    async fn verify_rrset(
-        &self,
-        context: RrsetVerificationContext<'_>,
-    ) -> Result<RrsetProof, ProofError> {
-        let key = context.key();
-
-        if let Some(cached) = self.validation_cache.get(&key, &context) {
-            return cached;
-        }
-
-        // DNSKEYS have different logic for their verification
-        let proof = match context.rrset.record_type {
-            RecordType::DNSKEY => self.verify_dnskey_rrset(&context).await,
-            _ => self.verify_default_rrset(&context).await,
-        };
-
-        match &proof {
-            // These could be transient errors that should be retried.
-            Err(e) if matches!(e.kind(), ProofErrorKind::Net { .. }) => {
-                debug!("not caching DNSSEC validation with ProofErrorKind::Net")
-            }
-            _ => {
-                self.validation_cache.insert(proof.clone(), key, &context);
-            }
-        }
-
-        proof
+        VerifiedRrsetMap(map)
     }
 
     /// DNSKEY-specific verification
@@ -561,26 +470,26 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         context: &RrsetVerificationContext<'_>,
     ) -> Result<RrsetProof, ProofError> {
         let RrsetVerificationContext {
+            key,
             rrset,
-            rrsigs,
             current_time,
             options,
             ..
-        } = context;
+        } = *context;
 
         // Ensure that this method is not misused
-        if RecordType::DNSKEY != rrset.record_type {
+        if RecordType::DNSKEY != key.record_type {
             panic!("All other RRSETs must use verify_default_rrset");
         }
 
         debug!(
-            "dnskey validation {}, record_type: {:?}",
-            rrset.name, rrset.record_type
+            rrset_name = ?key.name,
+            rrset_type = ?key.record_type,
+            "validating rrset with dnskeys",
         );
 
-        let mut dnskey_proofs =
-            Vec::<(Proof, Option<u32>, Option<usize>)>::with_capacity(rrset.records.len());
-        dnskey_proofs.resize(rrset.records.len(), (Proof::Bogus, None, None));
+        let mut dnskey_proofs: Vec<(Proof, Option<u32>, Option<usize>)> =
+            vec![(Proof::Bogus, None, None); rrset.records.len()];
 
         // check if the DNSKEYs are in the root store
         for (r, proof) in rrset.records.iter().zip(dnskey_proofs.iter_mut()) {
@@ -592,11 +501,11 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         }
 
         // if not all of the DNSKEYs are in the root store, then we need to look for DS records to verify
-        let ds_records = if !dnskey_proofs.iter().all(|p| p.0.is_secure()) && !rrset.name.is_root()
-        {
+        let ds_records = if !dnskey_proofs.iter().all(|p| p.0.is_secure()) && !key.name.is_root() {
             // Need to get DS records for each DNSKEY.
             // Every DNSKEY other than the root zone's keys may have a corresponding DS record.
-            self.fetch_ds_records(rrset.name.clone(), *options).await?
+            self.fetch_ds_records(Name::from(&key.name), options)
+                .await?
         } else {
             debug!("ignoring DS lookup for root zone or registered keys");
             Vec::default()
@@ -606,10 +515,8 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         // for secure DS records the BOGUS check happens after DNSKEYs are evaluated against the DS
         if ds_records
             .iter()
-            .filter(|ds| ds.proof().is_secure() || ds.proof().is_insecure())
-            .all(|ds| {
-                !ds.data().algorithm().is_supported() || !ds.data().digest_type().is_supported()
-            })
+            .filter(|ds| ds.proof.is_secure() || ds.proof.is_insecure())
+            .all(|ds| !ds.data.algorithm().is_supported() || !ds.data.digest_type().is_supported())
             && !ds_records.is_empty()
         {
             debug!(
@@ -641,8 +548,11 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
 
         // There may have been a key-signing key for the zone,
         //   we need to verify all the other DNSKEYS in the zone against it (i.e. the rrset)
-        for (i, rrsig) in rrsigs.iter().enumerate() {
+        for (i, rrsig) in rrset.signatures.iter().enumerate() {
             // These should all match, but double checking...
+            let Some(rrsig) = rrsig.try_borrow::<RRSIG>() else {
+                continue;
+            };
             let signer_name = &rrsig.data().input().signer_name;
 
             let rrset_proof = rrset
@@ -650,14 +560,14 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 .iter()
                 .zip(dnskey_proofs.iter())
                 .filter(|(_, (proof, ..))| proof.is_secure())
-                .filter(|(r, _)| r.name() == signer_name)
+                .filter(|(r, _)| &r.name == signer_name)
                 .filter_map(|(r, (proof, ..))| {
-                    RecordRef::<'_, DNSKEY>::try_from(*r)
+                    RecordRef::<'_, DNSKEY>::try_from(&**r)
                         .ok()
                         .map(|r| (r, proof))
                 })
                 .find_map(|(dnskey, proof)| {
-                    verify_rrset_with_dnskey(dnskey, *proof, rrsig, rrset, *current_time).ok()
+                    verify_rrset_with_dnskey(dnskey, *proof, &rrsig, key, rrset, current_time).ok()
                 });
 
             if let Some(rrset_proof) = rrset_proof {
@@ -681,11 +591,15 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
 
         if !ds_records.is_empty() {
             // there were DS records, but no DNSKEYs, we're in a bogus state
-            trace!("bogus dnskey: {}", rrset.name);
+            trace!(
+                rrset_name = ?key.name,
+                ?ds_records,
+                "bogus validation: missing dnskeys, but have ds records",
+            );
             return Err(ProofError::new(
                 Proof::Bogus,
                 ProofErrorKind::DsRecordsButNoDnskey {
-                    name: rrset.name.clone(),
+                    name: Name::from(&key.name),
                 },
             ));
         }
@@ -693,11 +607,11 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         // There were DS records or RRSIGs, but none of the signatures could be validated, so we're in a
         // bogus state. If there was no DS record, it should have gotten an NSEC upstream, and returned
         // early above.
-        trace!("no dnskey found: {}", rrset.name);
+        trace!(rrset_name = ?key.name, "no dnskey found");
         Err(ProofError::new(
             Proof::Bogus,
             ProofErrorKind::DnskeyNotFound {
-                name: rrset.name.clone(),
+                name: Name::from(&key.name),
             },
         ))
     }
@@ -724,7 +638,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             }
 
             // Make an un-verified request for the NS RRset at this ancestor name.
-            let query = Query::query(ancestor.clone(), RecordType::NS);
+            let query = Query::new(ancestor.clone(), RecordType::NS);
             let result = self
                 .handle
                 .lookup(query.clone(), options)
@@ -733,7 +647,7 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             match result {
                 Ok(response) => {
                     if response.all_sections().any(|record| {
-                        record.record_type() == RecordType::NS && record.name() == &ancestor
+                        record.record_type() == RecordType::NS && record.name == ancestor
                     }) {
                         break ancestor;
                     }
@@ -760,36 +674,36 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         zone: Name,
         options: DnsRequestOptions,
     ) -> Result<Vec<Record<DS>>, ProofError> {
-        let ds_message = self
-            .lookup(Query::query(zone.clone(), RecordType::DS), options)
+        match self
+            .lookup(Query::new(zone.clone(), RecordType::DS), options)
             .first_answer()
-            .await;
-
-        let error_opt = match ds_message {
+            .await
+        {
             Ok(mut ds_message)
                 if ds_message
-                    .answers()
+                    .answers
                     .iter()
                     .filter(|r| r.record_type() == RecordType::DS)
-                    .any(|r| r.proof().is_secure()) =>
+                    .any(|r| r.proof.is_secure()) =>
             {
                 // This is a secure DS RRset.
-
-                let all_records = ds_message.take_answers().into_iter().filter_map(|r| {
-                    r.map(|data| match data {
-                        RData::DNSSEC(DNSSECRData::DS(ds)) => Some(ds),
-                        _ => None,
-                    })
-                });
+                let all_records = mem::take(&mut ds_message.answers)
+                    .into_iter()
+                    .filter_map(|r| {
+                        r.map(|data| match data {
+                            RData::DNSSEC(DNSSECRData::DS(ds)) => Some(ds),
+                            _ => None,
+                        })
+                    });
 
                 let mut supported_records = vec![];
                 let mut all_unknown = None;
                 for record in all_records {
                     // A chain can be either SECURE or INSECURE, but we should not trust BOGUS or other
                     // records.
-                    if (!record.data().algorithm().is_supported()
-                        || !record.data().digest_type().is_supported())
-                        && (record.proof().is_secure() || record.proof().is_insecure())
+                    if (!record.data.algorithm().is_supported()
+                        || !record.data.digest_type().is_supported())
+                        && (record.proof.is_secure() || record.proof.is_insecure())
                     {
                         all_unknown.get_or_insert(true);
                         continue;
@@ -806,49 +720,25 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                     ));
                 } else if !supported_records.is_empty() {
                     return Ok(supported_records);
-                } else {
-                    None
                 }
             }
             Ok(response) => {
-                let any_ds_rr = response
-                    .answers()
+                if !response
+                    .answers
                     .iter()
-                    .any(|r| r.record_type() == RecordType::DS);
-                if any_ds_rr {
-                    None
-                } else {
-                    // If the response was an authenticated proof of nonexistence, then we have an
-                    // insecure zone.
-                    debug!("marking {zone} as insecure based on secure NSEC/NSEC3 proof");
+                    .any(|r| r.record_type() == RecordType::DS)
+                {
+                    debug!(
+                        %zone,
+                        "marking zone as insecure based on secure NSEC/NSEC3 proof or insecure parent zone",
+                    );
                     return Err(ProofError::new(
                         Proof::Insecure,
-                        ProofErrorKind::DsResponseNsec { name: zone },
+                        ProofErrorKind::DsResponseInsecure { name: zone },
                     ));
                 }
             }
-            Err(error) => Some(error),
-        };
-
-        // If the response was an empty DS RRset that was itself insecure, then we have another insecure zone.
-        let dns_err = error_opt.as_ref().and_then(|e| match &e {
-            NetError::Dns(err) => Some(err),
-            _ => None,
-        });
-
-        if let Some(DnsError::Nsec { query, proof, .. }) = dns_err {
-            if proof.is_insecure() {
-                debug!(
-                    "marking {} as insecure based on insecure NSEC/NSEC3 proof",
-                    query.name()
-                );
-                return Err(ProofError::new(
-                    Proof::Insecure,
-                    ProofErrorKind::DsResponseNsec {
-                        name: query.name().to_owned(),
-                    },
-                ));
-            }
+            Err(_) => {}
         }
 
         Err(ProofError::ds_should_exist(zone))
@@ -897,46 +787,47 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
     ) -> Result<RrsetProof, ProofError> {
         let RrsetVerificationContext {
             query: original_query,
+            key,
             rrset,
-            rrsigs,
             current_time,
             options,
-        } = context;
+        } = *context;
 
         // Ensure that this method is not misused
-        if RecordType::DNSKEY == rrset.record_type {
+        if RecordType::DNSKEY == key.record_type {
             panic!("DNSKEYs must be validated with verify_dnskey_rrset");
         }
 
-        if rrsigs.is_empty() {
+        if rrset.signatures.is_empty() {
             // Decide if we're:
             //    1) "insecure", the zone has a valid NSEC for the DS record in the parent zone
             //    2) "bogus", the parent zone has a valid DS record, but the child zone didn't have the RRSIGs/DNSKEYs
             //       or the parent zone has a DS record without covering RRSIG records.
-            if rrset.record_type != RecordType::DS {
-                let mut search_name = rrset.name.clone();
-                if rrset.record_type == RecordType::NSEC3 {
+            if key.record_type != RecordType::DS {
+                let mut search_name = Name::from(&key.name);
+                if key.record_type == RecordType::NSEC3 {
                     // No need to look for a zone cut at an NSEC3 owner name. Look at its parent
                     // instead, which ought to be a zone apex.
                     search_name = search_name.base_name();
                 }
 
-                self.find_ds_records(search_name, *options).await?; // insecure will return early here
+                self.find_ds_records(search_name, options).await?; // insecure will return early here
             }
 
             return Err(ProofError::new(
                 Proof::Bogus,
                 ProofErrorKind::RrsigsNotPresent {
-                    name: rrset.name.clone(),
-                    record_type: rrset.record_type,
+                    name: Name::from(&key.name),
+                    record_type: key.record_type,
                 },
             ));
         }
 
         // the record set is going to be shared across a bunch of futures, Arc for that.
         trace!(
-            "default validation {}, record_type: {:?}",
-            rrset.name, rrset.record_type
+            rrset_name = ?key.name,
+            rrset_type = ?key.record_type,
+            "default rrset validation",
         );
 
         // we can validate with any of the rrsigs...
@@ -948,44 +839,59 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         //         susceptible until that algorithm is removed as an option.
         //        dns over TLS will mitigate this.
         //  TODO: strip RRSIGS to accepted algorithms and make algorithms configurable.
-        let verifications = rrsigs
+        let verifications = rrset
+            .signatures
             .iter()
             .enumerate()
             .filter_map(|(i, rrsig)| {
+                let rrsig = rrsig.try_borrow::<RRSIG>()?;
                 let query =
-                    Query::query(rrsig.data().input().signer_name.clone(), RecordType::DNSKEY);
+                    Query::new(rrsig.data().input().signer_name.clone(), RecordType::DNSKEY);
 
                 if i > MAX_RRSIGS_PER_RRSET {
-                    warn!("too many ({i}) RRSIGs for rrset {rrset:?}; skipping");
+                    warn!(
+                        rrset_name = ?key.name,
+                        rrset_type = ?key.record_type,
+                        count = rrset.signatures.len(),
+                        "too many RRSIGs for rrset; skipping"
+                    );
                     return None;
                 }
 
-                // TODO: Should this sig.signer_name should be confirmed to be in the same zone as the rrsigs and rrset?
+                // TODO: Should this sig.signer_name should be confirmed to be in the same zone as
+                // the rrsigs and rrset?
+                //
                 // Break verification cycle
-                if query.name() == original_query.name()
-                    && query.query_type() == original_query.query_type()
+                if query.name == original_query.name
+                    && query.query_type == original_query.query_type
                 {
                     warn!(
-                        query_name = %query.name(),
-                        query_type = %query.query_type(),
-                        original_query_name = %original_query.name(),
-                        original_query_type = %original_query.query_type(),
+                        query_name = %query.name,
+                        query_type = %query.query_type,
+                        original_query_name = %original_query.name,
+                        original_query_type = %original_query.query_type,
                         "stopping verification cycle in verify_default_rrset",
                     );
                     return None;
                 }
 
                 Some(
-                    self.lookup(query.clone(), *options)
+                    self.lookup(query.clone(), options)
                         .first_answer()
                         .map(move |result| match result {
                             Ok(message) => {
-                                Ok(verify_rrsig_with_keys(message, rrsig, rrset, *current_time)
-                                    .map(|(proof, adjusted_ttl)| RrsetProof {
-                                        proof,
-                                        adjusted_ttl,
-                                        rrsig_index: Some(i),
-                                    }))
+                                let verdict_opt = verify_rrsig_with_keys(
+                                    message,
+                                    &rrsig,
+                                    key,
+                                    rrset,
+                                    current_time,
+                                );
+                                Ok(verdict_opt.map(|(proof, adjusted_ttl)| RrsetProof {
+                                    proof,
+                                    adjusted_ttl,
+                                    rrsig_index: Some(i),
+                                }))
                             }
                             Err(net) => Err(ProofError::new(
                                 Proof::Bogus,
@@ -1001,8 +907,8 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             return Err(ProofError::new(
                 Proof::Bogus,
                 ProofErrorKind::RrsigsNotPresent {
-                    name: rrset.name.clone(),
-                    record_type: rrset.record_type,
+                    name: Name::from(&key.name),
+                    record_type: key.record_type,
                 },
             ));
         }
@@ -1017,8 +923,8 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
         proof.ok_or_else(||
             // we are in a bogus state, DS records were available (see beginning of function), but RRSIGs couldn't be verified
             ProofError::new(Proof::Bogus, ProofErrorKind::RrsigsUnverified {
-                name: rrset.name.clone(),
-                record_type: rrset.record_type,
+                name: Name::from(&key.name),
+                record_type: key.record_type,
             }
         ))
     }
@@ -1062,27 +968,24 @@ impl<H: DnsHandle> DnsHandle for DnssecDnsHandle<H> {
         }
 
         // dnssec only matters on queries.
-        match request.op_code() {
+        match request.op_code {
             OpCode::Query => {}
             _ => return Box::pin(self.handle.send(request)),
         }
 
         // This will fail on no queries, that is a very odd type of request, isn't it?
         // TODO: with mDNS there can be multiple queries
-        let Some(query) = request.queries().first().cloned() else {
+        let Some(query) = request.queries.first().cloned() else {
             return Box::pin(stream::once(future::err(NetError::from(
                 "no query in request",
             ))));
         };
 
         let handle = self.clone_with_context();
-        request
-            .extensions_mut()
-            .get_or_insert_with(Edns::new)
-            .enable_dnssec();
+        request.edns.get_or_insert_with(Edns::new).enable_dnssec();
 
-        request.set_authentic_data(true);
-        request.set_checking_disabled(false);
+        request.metadata.authentic_data = true;
+        request.metadata.checking_disabled = false;
         let options = *request.options();
 
         Box::pin(self.handle.send(request).then(move |result| {
@@ -1096,23 +999,25 @@ impl<H: DnsHandle> DnsHandle for DnssecDnsHandle<H> {
 fn verify_rrsig_with_keys(
     dnskey_message: DnsResponse,
     rrsig: &RecordRef<'_, RRSIG>,
+    key: &RrKey,
     rrset: &Rrset<'_>,
     current_time: u32,
 ) -> Option<(Proof, Option<u32>)> {
     let mut tag_count = HashMap::<u16, usize>::new();
 
-    if (rrset.record_type == RecordType::NSEC || rrset.record_type == RecordType::NSEC3)
-        && rrset.name.num_labels() != rrsig.data().input().num_labels
+    if (key.record_type == RecordType::NSEC || key.record_type == RecordType::NSEC3)
+        && key.name.num_labels() != rrsig.data().input().num_labels
     {
         warn!(
-            "{} record signature claims to be expanded from a wildcard",
-            rrset.record_type
+            rrset_name = ?key.name,
+            rrset_type = ?key.record_type,
+            "record signature claims to be expanded from a wildcard",
         );
         return None;
     }
 
     // DNSKEYs were already validated by the inner query in the above lookup
-    let dnskeys = dnskey_message.answers().iter().filter_map(|r| {
+    let dnskeys = dnskey_message.answers.iter().filter_map(|r| {
         let dnskey = r.try_borrow::<DNSKEY>()?;
 
         let tag = match dnskey.data().calculate_key_tag() {
@@ -1142,9 +1047,14 @@ fn verify_rrsig_with_keys(
         match dnskey.proof() {
             Proof::Secure => {
                 all_insecure = Some(false);
-                if let Ok(proof) =
-                    verify_rrset_with_dnskey(dnskey, dnskey.proof(), rrsig, rrset, current_time)
-                {
+                if let Ok(proof) = verify_rrset_with_dnskey(
+                    dnskey,
+                    dnskey.proof(),
+                    rrsig,
+                    key,
+                    rrset,
+                    current_time,
+                ) {
                     return Some((proof.0, proof.1));
                 }
             }
@@ -1169,9 +1079,9 @@ fn verify_rrsig_with_keys(
 /// See RFC 4035 B.4 - Referral to Signed Zone, B.5 Referral to Unsigned Zone, B.6 - Wildcard
 /// Expansion, RFC 5155 B.3 - Referral to an Opt-Out Unsigned Zone, and B.4 - Wildcard Expansion.
 fn find_soa_name(verified_message: &DnsResponse) -> Option<&Name> {
-    for record in verified_message.authorities() {
+    for record in &verified_message.authorities {
         if record.record_type() == RecordType::SOA {
-            return Some(record.name());
+            return Some(&record.name);
         }
     }
 
@@ -1203,23 +1113,20 @@ fn verify_dnskey(
 
     // DS check if covered by DS keys
     let mut key_authentication_attempts = 0;
-    for r in ds_records.iter().filter(|ds| ds.proof().is_secure()) {
-        if r.data().algorithm() != key_algorithm {
+    for r in ds_records.iter().filter(|ds| ds.proof.is_secure()) {
+        if r.data.algorithm() != key_algorithm {
             trace!(
                 "skipping DS record due to algorithm mismatch, expected algorithm {}: ({}, {})",
-                key_algorithm,
-                r.name(),
-                r.data(),
+                key_algorithm, r.name, r.data,
             );
 
             continue;
         }
 
-        if r.data().key_tag() != key_tag {
+        if r.data.key_tag() != key_tag {
             trace!(
                 "skipping DS record due to key tag mismatch, expected tag {key_tag}: ({}, {})",
-                r.name(),
-                r.data(),
+                r.name, r.data,
             );
 
             continue;
@@ -1238,15 +1145,15 @@ fn verify_dnskey(
             continue;
         }
 
-        if !r.data().covers(rr.name(), key_rdata).unwrap_or(false) {
+        if !r.data.covers(rr.name(), key_rdata).unwrap_or(false) {
             continue;
         }
 
         debug!(
             "validated dnskey ({}, {key_rdata}) with {} {}",
             rr.name(),
-            r.name(),
-            r.data(),
+            r.name,
+            r.data,
         );
 
         // If this key is valid, then it is secure
@@ -1262,11 +1169,12 @@ fn verify_dnskey(
     ))
 }
 
-/// Verifies the given SIG of the RRSET with the DNSKEY.
+/// Verifies the given signature over the RRset with the given DNSKEY.
 fn verify_rrset_with_dnskey(
     dnskey: RecordRef<'_, DNSKEY>,
     dnskey_proof: Proof,
     rrsig: &RecordRef<'_, RRSIG>,
+    key: &RrKey,
     rrset: &Rrset<'_>,
     current_time: u32,
 ) -> Result<(Proof, Option<u32>), ProofError> {
@@ -1313,7 +1221,7 @@ fn verify_rrset_with_dnskey(
         ));
     }
 
-    let validity = RrsigValidity::check(*rrsig, rrset, dnskey, current_time);
+    let validity = RrsigValidity::check(*rrsig, key, rrset, dnskey, current_time);
     if !matches!(validity, RrsigValidity::ValidRrsig) {
         // TODO better error handling when the error payload is not immediately discarded by
         // the caller
@@ -1323,44 +1231,65 @@ fn verify_rrset_with_dnskey(
         ));
     }
 
-    dnskey
-        .data()
-        .verify_rrsig(
-            &rrset.name,
-            rrset.record_class,
-            rrsig.data(),
-            rrset.records.iter().copied(),
-        )
-        .map(|_| {
+    let Some(first_record) = rrset.records.first() else {
+        debug!(
+            rrset_name = ?key.name,
+            rrset_type = ?key.record_type,
+            "unable to validate record: no record in rrset",
+        );
+        return Ok((Proof::Bogus, None));
+    };
+
+    if rrsig.dns_class() != DNSClass::IN {
+        debug!(
+            rrset_name = ?key.name,
+            rrset_type = ?key.record_type,
+            class = ?rrsig.dns_class(),
+            "ignoring RRSIG with class other than IN"
+        );
+        return Err(ProofError::new(
+            Proof::Bogus,
+            ProofErrorKind::Msg("RRSIG record has unsupported class".to_string()),
+        ));
+    }
+    let result = dnskey.data().verify_rrsig(
+        &key.name,
+        DNSClass::IN,
+        rrsig.data(),
+        rrset.records.iter().map(|record| &**record),
+    );
+    match result {
+        Ok(_) => {
             debug!(
-                "validated ({}, {:?}) with ({}, {})",
-                rrset.name,
-                rrset.record_type,
-                dnskey.name(),
-                dnskey.data()
+                rrset_name = ?key.name,
+                rrset_type = ?key.record_type,
+                dnskey_name = ?dnskey.name(),
+                dnskey_data = ?dnskey.data(),
+                "validated rrset with dnskey",
             );
-            (
+            Ok((
                 Proof::Secure,
-                Some(rrsig.data().authenticated_ttl(rrset.record(), current_time)),
-            )
-        })
-        .map_err(|e| {
+                Some(rrsig.data().authenticated_ttl(first_record, current_time)),
+            ))
+        }
+        Err(e) => {
             debug!(
-                "failed validation of ({}, {:?}) with ({}, {})",
-                rrset.name,
-                rrset.record_type,
-                dnskey.name(),
-                dnskey.data()
+                rrset_name = ?key.name,
+                rrset_type = ?key.record_type,
+                dnskey_name = ?dnskey.name(),
+                dnskey_data = ?dnskey.data(),
+                "failed rrset validation",
             );
-            ProofError::new(
+            Err(ProofError::new(
                 Proof::Bogus,
                 ProofErrorKind::DnsKeyVerifyRrsig {
                     name: dnskey.name().clone(),
                     key_tag: rrsig.data().input().key_tag,
                     error: e,
                 },
-            )
-        })
+            ))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1379,6 +1308,7 @@ impl RrsigValidity {
     // see section 5.3.1 of RFC4035 "Checking the RRSIG RR Validity"
     fn check(
         rrsig: RecordRef<'_, RRSIG>,
+        key: &RrKey,
         rrset: &Rrset<'_>,
         dnskey: RecordRef<'_, DNSKEY>,
         current_time: u32,
@@ -1387,22 +1317,30 @@ impl RrsigValidity {
             return Self::WrongDnskey;
         };
 
+        // "The RRSIG RR and the RRset MUST have the same owner name and the same class"
+        for record in rrset.records.iter() {
+            if record.dns_class != DNSClass::IN {
+                return Self::WrongRrsig;
+            }
+        }
+
         let current_time = SerialNumber::new(current_time);
         let sig_input = rrsig.data().input();
         if !(
             // "The RRSIG RR and the RRset MUST have the same owner name and the same class"
-            rrsig.name() == &rrset.name &&
-            rrsig.dns_class() == rrset.record_class &&
+            *rrsig.name() == **key.name() &&
 
-            // "The RRSIG RR's Signer's Name field MUST be the name of the zone that contains the RRset"
-            // TODO(^) the zone name is in the SOA record, which is not accessible from here
+            // "The RRSIG RR's Signer's Name field MUST be the name of the zone that contains the
+            // RRset"
+            // There is nothing to check here, but this does tell us which zone a signature comes
+            // from.
 
             // "The RRSIG RR's Type Covered field MUST equal the RRset's type"
-            sig_input.type_covered == rrset.record_type &&
+            sig_input.type_covered == key.record_type &&
 
-            // "The number of labels in the RRset owner name MUST be greater than or equal to the value
-            // in the RRSIG RR's Labels field"
-            rrset.name.num_labels() >= sig_input.num_labels
+            // "The number of labels in the RRset owner name MUST be greater than or equal to the
+            // value in the RRSIG RR's Labels field"
+            key.name.num_labels() >= sig_input.num_labels
         ) {
             return Self::WrongRrsig;
         }
@@ -1410,12 +1348,12 @@ impl RrsigValidity {
         // Section 3.1.5 of RFC4034 states that 'all comparisons involving these fields MUST use
         // "Serial number arithmetic", as defined in RFC1982'
         if !(
-            // "The validator's notion of the current time MUST be less than or equal to the time listed
-            // in the RRSIG RR's Expiration field"
+            // "The validator's notion of the current time MUST be less than or equal to the time
+            // listed in the RRSIG RR's Expiration field"
             current_time <= sig_input.sig_expiration &&
 
-            // "The validator's notion of the current time MUST be greater than or equal to the time
-            // listed in the RRSIG RR's Inception field"
+            // "The validator's notion of the current time MUST be greater than or equal to the
+            // time listed in the RRSIG RR's Inception field"
             current_time >= sig_input.sig_inception
         ) {
             return Self::ExpiredRrsig;
@@ -1471,15 +1409,15 @@ impl ValidationCache {
 
         if Instant::now() < ttl {
             debug!(
-                name = ?context.rrset.name,
-                record_type = ?context.rrset.record_type,
+                name = ?context.key.name,
+                record_type = ?context.key.record_type,
                 "returning cached DNSSEC validation",
             );
             Some(cached)
         } else {
             debug!(
-                name = ?context.rrset.name,
-                record_type = ?context.rrset.record_type,
+                name = ?context.key.name,
+                record_type = ?context.key.record_type,
                 "cached DNSSEC validation expired"
             );
             None
@@ -1493,8 +1431,8 @@ impl ValidationCache {
         cx: &RrsetVerificationContext<'_>,
     ) {
         debug!(
-            name = ?cx.rrset.name,
-            record_type = ?cx.rrset.record_type,
+            name = ?cx.key.name,
+            record_type = ?cx.key.record_type,
             "inserting DNSSEC validation cache entry",
         );
 
@@ -1507,21 +1445,198 @@ impl ValidationCache {
             (min, max) = positive_bounds.into_inner();
         }
 
+        let Some(first_record) = cx.rrset.records.first() else {
+            debug!(
+                name = ?cx.key.name,
+                record_type = ?cx.key.record_type,
+                "unable to insert cache entry - no record in rrset",
+            );
+            return;
+        };
+
         self.inner.lock().insert(
             key,
             (
-                Instant::now()
-                    + Duration::from_secs(cx.rrset.record().ttl().into()).clamp(min, max),
+                Instant::now() + Duration::from_secs(first_record.ttl.into()).clamp(min, max),
                 proof.clone(),
             ),
         );
     }
 }
 
+/// A collection of RRsets, with mutable access to the underlying records.
+struct RrsetMap<'a>(HashMap<RrKey, Rrset<'a>>);
+
+impl<'a> RrsetMap<'a> {
+    /// Splits records into RRsets.
+    fn new(records: &'a mut [Record]) -> Self {
+        let mut map = HashMap::<RrKey, Rrset<'_>>::new();
+        for record in records.iter_mut() {
+            let (is_rrsig, record_type) = match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => (true, rrsig.input().type_covered),
+                _ => (false, record.record_type()),
+            };
+
+            let rrset = map
+                .entry(RrKey::new(LowerName::new(&record.name), record_type))
+                .or_default();
+            match is_rrsig {
+                true => &mut rrset.signatures,
+                false => &mut rrset.records,
+            }
+            .push(record);
+        }
+        Self(map)
+    }
+}
+
+impl<'a> Deref for RrsetMap<'a> {
+    type Target = HashMap<RrKey, Rrset<'a>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> DerefMut for RrsetMap<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Represents an RRset as a collection of mutable references to [`Record`]s.
+#[derive(Default)]
+struct Rrset<'a> {
+    records: Vec<&'a mut Record>,
+    signatures: Vec<&'a mut Record>,
+}
+
+/// A collection of RRsets that have had their signatures verified.
+struct VerifiedRrsetMap<'a>(HashMap<RrKey, VerifiedRrset<'a>>);
+
+impl<'a> Deref for VerifiedRrsetMap<'a> {
+    type Target = HashMap<RrKey, VerifiedRrset<'a>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> DerefMut for VerifiedRrsetMap<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// An RRset, along with the results of signature verification.
+struct VerifiedRrset<'a> {
+    records: Vec<&'a mut Record>,
+    signatures: Vec<&'a Record>,
+    outcome: RrsigVerificationOutcome<'a>,
+}
+
+impl<'a> VerifiedRrset<'a> {
+    /// Updates the RRset with verification results and produces a `VerifiedRrset`.
+    fn update_rrset(
+        result: Result<RrsetProof, ProofError>,
+        name: &LowerName,
+        record_type: RecordType,
+        mut rrset: Rrset<'a>,
+    ) -> Self {
+        let proof = match result {
+            Ok(proof) => {
+                debug!("verified: {name} record_type: {record_type}");
+                proof
+            }
+            Err(err) => {
+                match err.kind() {
+                    ProofErrorKind::DsResponseInsecure { .. } => {
+                        debug!("verified insecure {name}/{record_type}")
+                    }
+                    kind => {
+                        debug!("failed to verify: {name} record_type: {record_type}: {kind}")
+                    }
+                }
+                RrsetProof {
+                    proof: err.proof,
+                    adjusted_ttl: None,
+                    rrsig_index: None,
+                }
+            }
+        };
+
+        let RrsetProof {
+            proof,
+            adjusted_ttl,
+            rrsig_index: rrsig_idx,
+        } = proof;
+
+        for record in rrset.records.iter_mut() {
+            record.proof = proof;
+            if let (Proof::Secure, Some(ttl)) = (proof, adjusted_ttl) {
+                record.ttl = ttl;
+            }
+        }
+
+        // only mark the RRSIG used for the proof
+        if let Some(rrsig_idx) = rrsig_idx {
+            if let Some(rrsig) = rrset.signatures.get_mut(rrsig_idx) {
+                rrsig.proof = proof;
+                if let (Proof::Secure, Some(ttl)) = (proof, adjusted_ttl) {
+                    rrsig.ttl = ttl;
+                }
+            } else {
+                warn!(
+                    "bad rrsig index {rrsig_idx} rrsigs.len = {}",
+                    rrset.signatures.len()
+                );
+            }
+        }
+
+        // Change from mutable references to immutable references. (This should be cheap due to
+        // specialization and optimization)
+        let signatures: Vec<&Record> = rrset
+            .signatures
+            .into_iter()
+            .map(|record| &*record)
+            .collect();
+
+        // Combine the `Proof` from the signature verification with the RRSIG record, if it was
+        // successful.
+        let outcome = match (proof, rrsig_idx.and_then(|i| signatures.get(i))) {
+            (
+                Proof::Secure,
+                Some(Record {
+                    name,
+                    data: RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+                    ..
+                }),
+            ) => RrsigVerificationOutcome::Secure { owner: name, rrsig },
+            (Proof::Insecure, _) => RrsigVerificationOutcome::Insecure,
+            (Proof::Bogus, _) | (Proof::Indeterminate, _) | (Proof::Secure, _) => {
+                RrsigVerificationOutcome::Bogus
+            }
+        };
+
+        Self {
+            records: rrset.records,
+            signatures,
+            outcome,
+        }
+    }
+}
+
+/// Signature verification result for an RRset.
+enum RrsigVerificationOutcome<'a> {
+    Secure { owner: &'a Name, rrsig: &'a RRSIG },
+    Insecure,
+    Bogus,
+}
+
 struct RrsetVerificationContext<'a> {
     query: &'a Query,
+    key: &'a RrKey,
     rrset: &'a Rrset<'a>,
-    rrsigs: Vec<RecordRef<'a, RRSIG>>,
     options: DnsRequestOptions,
     current_time: u32,
 }
@@ -1532,23 +1647,21 @@ impl<'a> RrsetVerificationContext<'a> {
     // cause cache misses.
     fn key(&self) -> ValidationCacheKey {
         let mut hasher = DefaultHasher::new();
-        self.query.name().hash(&mut hasher);
-        self.query.query_class().hash(&mut hasher);
-        self.query.query_type().hash(&mut hasher);
-        self.rrset.name.hash(&mut hasher);
-        self.rrset.record_class.hash(&mut hasher);
-        self.rrset.record_type.hash(&mut hasher);
+        self.query.name.hash(&mut hasher);
+        self.query.query_class.hash(&mut hasher);
+        self.query.query_type.hash(&mut hasher);
+        self.key.name.hash(&mut hasher);
+        self.key.record_type.hash(&mut hasher);
 
-        for rec in &self.rrset.records {
-            rec.name().hash(&mut hasher);
-            rec.dns_class().hash(&mut hasher);
-            rec.data().hash(&mut hasher);
+        for rec in self.rrset.records.iter() {
+            rec.name.hash(&mut hasher);
+            rec.dns_class.hash(&mut hasher);
+            rec.data.hash(&mut hasher);
         }
-
-        for rec in &self.rrsigs {
-            rec.name().hash(&mut hasher);
-            rec.dns_class().hash(&mut hasher);
-            rec.data().hash(&mut hasher);
+        for rec in self.rrset.signatures.iter() {
+            rec.name.hash(&mut hasher);
+            rec.dns_class.hash(&mut hasher);
+            rec.data.hash(&mut hasher);
         }
 
         ValidationCacheKey(hasher.finish())
@@ -1630,20 +1743,20 @@ fn verify_nsec(
     // we'll use that as the starting value for next_closest_encloser, otherwise, fall back to
     // the parent of the query name.
     let mut next_closest_encloser = if let Some(soa_name) = soa_name {
-        if !soa_name.zone_of(query.name()) {
+        if !soa_name.zone_of(&query.name) {
             return nsec1_yield(Proof::Bogus, "SOA record is for the wrong zone");
         }
         soa_name.clone()
     } else {
-        query.name().base_name()
+        query.name.base_name()
     };
 
     let have_answer = !answers.is_empty();
 
     // For a no data response with a directly matching NSEC record, we just need to verify the NSEC
     // type set does not contain the query type or CNAME.
-    if let Some((_, nsec_data)) = nsecs.iter().find(|(name, _)| query.name() == *name) {
-        return if nsec_data.type_set().contains(query.query_type())
+    if let Some((_, nsec_data)) = nsecs.iter().find(|(name, _)| &query.name == *name) {
+        return if nsec_data.type_set().contains(query.query_type)
             || nsec_data.type_set().contains(RecordType::CNAME)
         {
             nsec1_yield(Proof::Bogus, "direct match, record type should be present")
@@ -1658,7 +1771,7 @@ fn verify_nsec(
     }
 
     let Some((covering_nsec_name, covering_nsec_data)) =
-        find_nsec_covering_record(soa_name, query.name(), nsecs)
+        find_nsec_covering_record(soa_name, &query.name, nsecs)
     else {
         return nsec1_yield(
             Proof::Bogus,
@@ -1672,7 +1785,7 @@ fn verify_nsec(
     for seed_name in [covering_nsec_name, covering_nsec_data.next_domain_name()] {
         let mut candidate_name = seed_name.clone();
         while candidate_name.num_labels() > next_closest_encloser.num_labels() {
-            if candidate_name.zone_of(query.name()) {
+            if candidate_name.zone_of(&query.name) {
                 next_closest_encloser = candidate_name;
                 break;
             }
@@ -1705,24 +1818,24 @@ fn verify_nsec(
         answers
             .iter()
             .filter_map(|r| {
-                if r.proof() != Proof::Secure {
-                    debug!(name = ?r.name(), "ignoring RRSIG with insecure proof for wildcard_base_name");
+                if r.proof != Proof::Secure {
+                    debug!(name = ?r.name, "ignoring RRSIG with insecure proof for wildcard_base_name");
                     return None;
                 }
 
-                let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = r.data() else {
+                let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &r.data else {
                     return None;
                 };
 
                 let rrsig_labels = rrsig.input().num_labels;
-                if rrsig_labels >= r.name().num_labels() || rrsig_labels >= query.name().num_labels() {
-                    debug!(name = ?r.name(), labels = ?r.name().num_labels(), rrsig_labels, "ignoring RRSIG for wildcard base name rrsig_labels >= labels");
+                if rrsig_labels >= r.name.num_labels() || rrsig_labels >= query.name.num_labels() {
+                    debug!(name = ?r.name, labels = ?r.name.num_labels(), rrsig_labels, "ignoring RRSIG for wildcard base name rrsig_labels >= labels");
                     return None;
                 }
 
-                let trimmed_name = r.name().trim_to(rrsig_labels as usize);
-                if !trimmed_name.zone_of(query.name()) {
-                    debug!(name = ?r.name(), query_name = ?query.name(), "ignoring RRSIG for wildcard base name: RRSIG wildcard labels not a parent of query name");
+                let trimmed_name = r.name.trim_to(rrsig_labels as usize);
+                if !trimmed_name.zone_of(&query.name) {
+                    debug!(name = ?r.name, query_name = ?query.name, "ignoring RRSIG for wildcard base name: RRSIG wildcard labels not a parent of query name");
                     return None;
                 }
 
@@ -1733,7 +1846,7 @@ fn verify_nsec(
         // For no data responses, we have to recover the base name from a wildcard NSEC record as there are no answer RRSIGs present.
         nsecs
             .iter()
-            .filter(|(name, _)| name.is_wildcard() && name.base_name().zone_of(query.name()))
+            .filter(|(name, _)| name.is_wildcard() && name.base_name().zone_of(&query.name))
             .min_by_key(|(name, _)| name.num_labels())
             .map(|(name, _)| (*name).clone())
     };
@@ -1749,13 +1862,8 @@ fn verify_nsec(
         Some((_, _))
             if response_code == ResponseCode::NoError
                 && have_answer
-                && no_closer_matches(
-                    query.name(),
-                    soa_name,
-                    nsecs,
-                    wildcard_base_name.as_ref(),
-                )
-                && find_nsec_covering_record(soa_name, query.name(), nsecs).is_some() =>
+                && no_closer_matches(&query.name, soa_name, nsecs, wildcard_base_name.as_ref())
+                && find_nsec_covering_record(soa_name, &query.name, nsecs).is_some() =>
         {
             nsec1_yield(
                 Proof::Secure,
@@ -1768,9 +1876,9 @@ fn verify_nsec(
             && response_code == ResponseCode::NoError
             && nsecs.iter().any(|(name, nsec_data)| {
                 name == &&wildcard_name
-                    && !nsec_data.type_set().contains(query.query_type())
+                    && !nsec_data.type_set().contains(query.query_type)
                     && !nsec_data.type_set().contains(RecordType::CNAME)
-                    && no_closer_matches(query.name(), soa_name, nsecs, wildcard_base_name.as_ref())
+                    && no_closer_matches(&query.name, soa_name, nsecs, wildcard_base_name.as_ref())
             }) =>
         {
             nsec1_yield(Proof::Secure, "no direct match, covering wildcard present")
@@ -1858,48 +1966,9 @@ pub(super) fn proof_log_yield(
 ) -> Proof {
     debug!(
         "{nsec_type} proof for {name}, returning {proof}: {msg}",
-        name = query.name()
+        name = query.name
     );
     proof
-}
-
-mod rrset {
-    use crate::proto::rr::{DNSClass, Name, Record, RecordType};
-
-    // TODO: combine this with crate::rr::RecordSet?
-    #[derive(Debug)]
-    pub(super) struct Rrset<'r> {
-        pub(super) name: Name,
-        pub(super) record_class: DNSClass,
-        pub(super) record_type: RecordType,
-        pub(super) records: Vec<&'r Record>,
-    }
-
-    impl<'r> Rrset<'r> {
-        pub(super) fn new(record: &'r Record) -> Self {
-            Self {
-                name: record.name().clone(),
-                record_class: record.dns_class(),
-                record_type: record.record_type(),
-                records: vec![record],
-            }
-        }
-
-        /// Adds `record` to this RRset IFF it belongs to it
-        pub(super) fn add(&mut self, record: &'r Record) {
-            if self.name == *record.name()
-                && self.record_type == record.record_type()
-                && self.record_class == record.dns_class()
-            {
-                self.records.push(record);
-            }
-        }
-
-        /// Returns the first (main) record.
-        pub(super) fn record(&self) -> &Record {
-            self.records[0]
-        }
-    }
 }
 
 /// The maximum number of key tag collisions to accept when:
@@ -2031,7 +2100,7 @@ mod test {
         // Based on RFC 4035 B.2 - Name Error
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ml.example.")?, A),
+                &Query::new(Name::from_ascii("ml.example.")?, A),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NXDomain,
                 &[],
@@ -2058,7 +2127,7 @@ mod test {
         // Single NSEC that proves the record does not exist, and no covering wildcard exists.
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("a.example.")?, A),
+                &Query::new(Name::from_ascii("a.example.")?, A),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NXDomain,
                 &[],
@@ -2079,7 +2148,7 @@ mod test {
         subscribe();
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ml.example.")?, A),
+                &Query::new(Name::from_ascii("ml.example.")?, A),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NXDomain,
                 &[],
@@ -2107,7 +2176,7 @@ mod test {
         // Test without proving wildcard non-existence.
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ml.example.")?, A),
+                &Query::new(Name::from_ascii("ml.example.")?, A),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NXDomain,
                 &[],
@@ -2125,7 +2194,7 @@ mod test {
         // Invalid SOA
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ml.example.")?, A),
+                &Query::new(Name::from_ascii("ml.example.")?, A),
                 Some(&Name::from_ascii("example2.")?),
                 ResponseCode::NXDomain,
                 &[],
@@ -2160,7 +2229,7 @@ mod test {
         // Based on RFC 4035 B.3 - No Data Error
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ns1.example.")?, MX),
+                &Query::new(Name::from_ascii("ns1.example.")?, MX),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2179,7 +2248,7 @@ mod test {
         // Record type at the SOA does not exist.
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("example.")?, MX),
+                &Query::new(Name::from_ascii("example.")?, MX),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2205,7 +2274,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ns1.example.")?, MX),
+                &Query::new(Name::from_ascii("ns1.example.")?, MX),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2222,7 +2291,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ns1.example.")?, MX),
+                &Query::new(Name::from_ascii("ns1.example.")?, MX),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2240,7 +2309,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("ns1.example.")?, MX),
+                &Query::new(Name::from_ascii("ns1.example.")?, MX),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2280,7 +2349,7 @@ mod test {
             3600,
             RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
         );
-        rrsig_record.set_proof(Proof::Secure);
+        rrsig_record.proof = Proof::Secure;
 
         let answers = [
             Record::from_rdata(
@@ -2294,7 +2363,7 @@ mod test {
         // Based on RFC 4035 B.6 - Wildcard Expansion
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("a.z.w.example.")?, MX),
+                &Query::new(Name::from_ascii("a.z.w.example.")?, MX),
                 None,
                 ResponseCode::NoError,
                 &answers,
@@ -2313,7 +2382,7 @@ mod test {
         // This response could not have been synthesized from the query name (z.example can't be expanded from *.w.example
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("z.example.")?, MX),
+                &Query::new(Name::from_ascii("z.example.")?, MX),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &answers,
@@ -2361,7 +2430,7 @@ mod test {
             3600,
             RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
         );
-        rrsig_record.set_proof(Proof::Secure);
+        rrsig_record.proof = Proof::Secure;
 
         let answers = [
             Record::from_rdata(
@@ -2374,7 +2443,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("a.z.w.example.")?, MX),
+                &Query::new(Name::from_ascii("a.z.w.example.")?, MX),
                 None,
                 ResponseCode::NoError,
                 &answers,
@@ -2391,7 +2460,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("a.z.w.example.")?, MX),
+                &Query::new(Name::from_ascii("a.z.w.example.")?, MX),
                 None,
                 ResponseCode::NoError,
                 &answers,
@@ -2410,7 +2479,7 @@ mod test {
         // Based on RFC 4035 B.7 - Wildcard No Data Error
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("a.z.w.example.")?, AAAA),
+                &Query::new(Name::from_ascii("a.z.w.example.")?, AAAA),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2433,7 +2502,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("zzzzzz.hickory-dns.testing.")?, TXT),
+                &Query::new(Name::from_ascii("zzzzzz.hickory-dns.testing.")?, TXT),
                 Some(&Name::from_ascii("hickory-dns.testing.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2469,7 +2538,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("a.z.w.example.")?, AAAA),
+                &Query::new(Name::from_ascii("a.z.w.example.")?, AAAA),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2491,7 +2560,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("a.z.w.example.")?, AAAA),
+                &Query::new(Name::from_ascii("a.z.w.example.")?, AAAA),
                 Some(&Name::from_ascii("example.")?),
                 ResponseCode::NoError,
                 &[],
@@ -2513,7 +2582,7 @@ mod test {
 
         assert_eq!(
             verify_nsec(
-                &Query::query(Name::from_ascii("r.hickory-dns.testing.")?, TXT),
+                &Query::new(Name::from_ascii("r.hickory-dns.testing.")?, TXT),
                 Some(&Name::from_ascii("hickory-dns.testing.")?),
                 ResponseCode::NoError,
                 &[],

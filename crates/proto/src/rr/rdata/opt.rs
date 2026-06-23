@@ -22,7 +22,7 @@ use crate::{
     error::{ProtoError, ProtoResult},
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
     serialize::binary::{
-        BinDecodable, BinDecoder, BinEncodable, BinEncoder, RDataEncoding, Restrict,
+        BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, RDataEncoding, Restrict,
     },
 };
 
@@ -169,8 +169,10 @@ use crate::dnssec::SupportedAlgorithms;
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Default, Debug, Clone, Ord, PartialOrd)]
+#[non_exhaustive]
 pub struct OPT {
-    options: Vec<(EdnsCode, EdnsOption)>,
+    /// List of code and record type tuples
+    pub options: Vec<(EdnsCode, EdnsOption)>,
 }
 
 impl OPT {
@@ -251,8 +253,8 @@ impl BinEncodable for OPT {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         let mut encoder = encoder.with_rdata_behavior(RDataEncoding::Other);
         for (edns_code, edns_option) in self.as_ref().iter() {
-            encoder.emit_u16(u16::from(*edns_code))?;
-            encoder.emit_u16(edns_option.len())?;
+            u16::from(*edns_code).emit(&mut encoder)?;
+            edns_option.len().emit(&mut encoder)?;
             edns_option.emit(&mut encoder)?
         }
         Ok(())
@@ -260,7 +262,7 @@ impl BinEncodable for OPT {
 }
 
 impl<'r> RecordDataDecodable<'r> for OPT {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         let mut state: OptReadState = OptReadState::ReadCode;
         let mut options: Vec<(EdnsCode, EdnsOption)> = Vec::new();
         let start_idx = decoder.index();
@@ -281,7 +283,10 @@ impl<'r> RecordDataDecodable<'r> for OPT {
                         .read_u16()?
                         .map(|u| u as usize)
                         .verify_unwrap(|u| *u <= rdata_length)
-                        .map_err(|_| ProtoError::from("OPT value length exceeds rdata length"))?;
+                        .map_err(|opt_len| DecodeError::IncorrectRDataLengthRead {
+                            read: rdata_length,
+                            len: opt_len,
+                        })?;
                     // If we know that the length is 0, we can avoid the `OptReadState::Data` state
                     // and directly add the option to the map.
                     // The data state does not process 0-length correctly, since it always reads at
@@ -514,15 +519,15 @@ impl BinEncodable for EdnsOption {
             #[cfg(feature = "__dnssec")]
             EdnsOption::DAU(algorithms) => algorithms.emit(encoder),
             EdnsOption::Subnet(subnet) => subnet.emit(encoder),
-            EdnsOption::NSID(payload) => encoder.emit_vec(payload.as_ref()),
-            EdnsOption::Unknown(_, data) => encoder.emit_vec(data), // gah, clone needed or make a crazy api.
+            EdnsOption::NSID(payload) => encoder.emit_slice(payload.as_ref()),
+            EdnsOption::Unknown(_, data) => encoder.emit_slice(data), // gah, clone needed or make a crazy api.
         }
     }
 }
 
 /// only the supported extensions are listed right now.
 impl<'a> TryFrom<(EdnsCode, &'a [u8])> for EdnsOption {
-    type Error = ProtoError;
+    type Error = DecodeError;
 
     fn try_from(value: (EdnsCode, &'a [u8])) -> Result<Self, Self::Error> {
         Ok(match value.0 {
@@ -674,13 +679,13 @@ impl BinEncodable for ClientSubnet {
 
         match address {
             IpAddr::V4(ip) => {
-                encoder.emit_u16(1)?; // FAMILY: IPv4
-                encoder.emit_u8(source_prefix)?;
-                encoder.emit_u8(scope_prefix)?;
+                1u16.emit(encoder)?; // FAMILY: IPv4
+                source_prefix.emit(encoder)?;
+                scope_prefix.emit(encoder)?;
                 let octets = ip.octets();
                 let addr_len = addr_len as usize;
                 if addr_len <= octets.len() {
-                    encoder.emit_vec(&octets[0..addr_len])?
+                    encoder.emit_slice(&octets[0..addr_len])?
                 } else {
                     return Err(ProtoError::Message(
                         "Invalid addr length for encode EcsOption",
@@ -688,13 +693,13 @@ impl BinEncodable for ClientSubnet {
                 }
             }
             IpAddr::V6(ip) => {
-                encoder.emit_u16(2)?; // FAMILY: IPv6
-                encoder.emit_u8(source_prefix)?;
-                encoder.emit_u8(scope_prefix)?;
+                2u16.emit(encoder)?; // FAMILY: IPv6
+                source_prefix.emit(encoder)?;
+                scope_prefix.emit(encoder)?;
                 let octets = ip.octets();
                 let addr_len = addr_len as usize;
                 if addr_len <= octets.len() {
-                    encoder.emit_vec(&octets[0..addr_len])?
+                    encoder.emit_slice(&octets[0..addr_len])?
                 } else {
                     return Err(ProtoError::Message(
                         "Invalid addr length for encode EcsOption",
@@ -707,7 +712,7 @@ impl BinEncodable for ClientSubnet {
 }
 
 impl<'a> BinDecodable<'a> for ClientSubnet {
-    fn read(decoder: &mut BinDecoder<'a>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'a>) -> Result<Self, DecodeError> {
         let family = decoder.read_u16()?.unverified();
 
         match family {
@@ -719,7 +724,10 @@ impl<'a> BinDecodable<'a> for ClientSubnet {
                     (source_prefix / 8 + if source_prefix % 8 > 0 { 1 } else { 0 }) as usize;
                 let mut octets = Ipv4Addr::UNSPECIFIED.octets();
                 if addr_len > octets.len() {
-                    return Err(ProtoError::Message("Invalid address length"));
+                    return Err(DecodeError::IncorrectRDataLengthRead {
+                        read: octets.len(),
+                        len: addr_len,
+                    });
                 }
                 for octet in octets.iter_mut().take(addr_len) {
                     *octet = decoder.read_u8()?.unverified();
@@ -738,7 +746,10 @@ impl<'a> BinDecodable<'a> for ClientSubnet {
                     (source_prefix / 8 + if source_prefix % 8 > 0 { 1 } else { 0 }) as usize;
                 let mut octets = Ipv6Addr::UNSPECIFIED.octets();
                 if addr_len > octets.len() {
-                    return Err(ProtoError::Message("Invalid address length"));
+                    return Err(DecodeError::IncorrectRDataLengthRead {
+                        read: octets.len(),
+                        len: addr_len,
+                    });
                 }
                 for octet in octets.iter_mut().take(addr_len) {
                     *octet = decoder.read_u8()?.unverified();
@@ -750,7 +761,7 @@ impl<'a> BinDecodable<'a> for ClientSubnet {
                     scope_prefix,
                 })
             }
-            _ => Err(ProtoError::Message("Invalid family type.")),
+            _ => Err(DecodeError::UnknownAddressFamily(family)),
         }
     }
 }
@@ -768,7 +779,7 @@ impl<'a> TryFrom<&'a ClientSubnet> for Vec<u8> {
 }
 
 impl<'a> TryFrom<&'a [u8]> for ClientSubnet {
-    type Error = ProtoError;
+    type Error = DecodeError;
 
     fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
         let mut decoder = BinDecoder::new(value);
@@ -816,10 +827,16 @@ impl NSIDPayload {
 }
 
 impl<'a> TryFrom<&'a [u8]> for NSIDPayload {
-    type Error = ProtoError;
+    type Error = DecodeError;
 
     fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
-        NSIDPayload::new(value)
+        if value.len() > u16::MAX as usize {
+            return Err(DecodeError::IncorrectRDataLengthRead {
+                read: value.len(),
+                len: u16::MAX as usize,
+            });
+        }
+        Ok(Self(value.to_vec()))
     }
 }
 
@@ -946,10 +963,10 @@ mod tests {
     #[test]
     fn test_nsid_payload_too_large() {
         let err = NSIDPayload::try_from([0x00; (u16::MAX as usize) + 1].as_slice()).unwrap_err();
-        let ProtoError::Message(msg) = &err else {
-            panic!("expected ProtoErrorKind::Message, got {err}");
-        };
-        assert!(msg.contains("too large"));
+        assert!(
+            matches!(err, DecodeError::IncorrectRDataLengthRead { .. }),
+            "expected IncorrectRDataLengthRead, got {err}"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     dnssec::Nsec3HashAlgorithm,
-    error::{ProtoError, ProtoResult},
+    error::ProtoResult,
     rr::{RData, RecordData, RecordType},
     serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError},
 };
@@ -172,18 +172,18 @@ impl NSEC3PARAM {
 
 impl BinEncodable for NSEC3PARAM {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit(self.hash_algorithm().into())?;
-        encoder.emit(self.flags())?;
-        encoder.emit_u16(self.iterations())?;
-        encoder.emit(self.salt().len() as u8)?;
-        encoder.emit_vec(self.salt())?;
+        u8::from(self.hash_algorithm).emit(encoder)?;
+        self.flags().emit(encoder)?;
+        self.iterations().emit(encoder)?;
+        (self.salt().len() as u8).emit(encoder)?;
+        encoder.emit_slice(self.salt())?;
 
         Ok(())
     }
 }
 
 impl<'r> BinDecodable<'r> for NSEC3PARAM {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let hash_algorithm = Nsec3HashAlgorithm::try_from(
             decoder.read_u8()?.unverified(/*Algorithm verified as safe*/),
         )?;
@@ -198,7 +198,10 @@ impl<'r> BinDecodable<'r> for NSEC3PARAM {
             .read_u8()?
             .map(|u| u as usize)
             .verify_unwrap(|salt_len| *salt_len <= decoder.len())
-            .map_err(|_| ProtoError::from("salt_len exceeds buffer length"))?;
+            .map_err(|salt_len| DecodeError::IncorrectRDataLengthRead {
+                read: decoder.len(),
+                len: salt_len,
+            })?;
         let salt: Vec<u8> = decoder.read_vec(salt_len)?.unverified(/*valid as any array of u8*/);
 
         Ok(Self::new(hash_algorithm, opt_out, iterations, salt))

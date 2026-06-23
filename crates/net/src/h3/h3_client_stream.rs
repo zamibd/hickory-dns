@@ -12,6 +12,7 @@ use core::pin::Pin;
 use core::str::FromStr;
 use core::task::{Context, Poll};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures_util::stream::Stream;
@@ -20,6 +21,7 @@ use h3_quinn::OpenStreams;
 use http::header::{self, CONTENT_LENGTH};
 use quinn::{Endpoint, EndpointConfig, TransportConfig};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::error::NetError;
@@ -30,7 +32,7 @@ use crate::quic::connect_quic;
 use crate::runtime::{RuntimeProvider, Spawn};
 use crate::tls::client_config;
 use crate::udp::UdpSocket;
-use crate::xfer::{DnsExchange, DnsRequestSender, DnsResponseStream};
+use crate::xfer::{CONNECT_TIMEOUT, DnsExchange, DnsRequestSender, DnsResponseStream};
 
 use super::ALPN_H3;
 
@@ -55,6 +57,7 @@ impl H3ClientStream {
             bind_addr: None,
             set_headers: None,
             disable_grease: false,
+            connect_timeout: CONNECT_TIMEOUT,
         }
     }
 
@@ -71,25 +74,13 @@ impl H3ClientStream {
         debug!("request: {:#?}", request);
 
         // Send the request
-        let mut stream = h3
-            .send_request(request)
-            .await
-            .map_err(|err| NetError::from(format!("h3 send_request error: {err}")))?;
+        let mut stream = h3.send_request(request).await?;
 
-        stream
-            .send_data(message)
-            .await
-            .map_err(|e| NetError::from(format!("h3 send_data error: {e}")))?;
+        stream.send_data(message).await?;
 
-        stream
-            .finish()
-            .await
-            .map_err(|err| NetError::from(format!("received a stream error: {err}")))?;
+        stream.finish().await?;
 
-        let response = stream
-            .recv_response()
-            .await
-            .map_err(|err| NetError::from(format!("h3 recv_response error: {err}")))?;
+        let response = stream.recv_response().await?;
 
         debug!("got response: {:#?}", response);
 
@@ -236,7 +227,7 @@ impl DnsRequestSender for H3ClientStream {
         }
 
         // per the RFC, a zero id allows for the HTTP packet to be cached better
-        request.set_id(0);
+        request.metadata.id = 0;
 
         let bytes = match request.to_vec() {
             Ok(bytes) => bytes,
@@ -297,6 +288,7 @@ pub struct H3ClientStreamBuilder {
     bind_addr: Option<SocketAddr>,
     set_headers: Option<Arc<dyn SetHeaders>>,
     disable_grease: bool,
+    connect_timeout: Duration,
 }
 
 impl H3ClientStreamBuilder {
@@ -320,6 +312,14 @@ impl H3ClientStreamBuilder {
     /// Sets whether to disable GREASE
     pub fn disable_grease(mut self, disable_grease: bool) -> Self {
         self.disable_grease = disable_grease;
+        self
+    }
+
+    /// Override the connect timeout (default: 2 seconds).
+    ///
+    /// This controls the QUIC connect and the HTTP/3 handshake timeouts.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
@@ -414,25 +414,34 @@ impl H3ClientStreamBuilder {
         server_name: Arc<str>,
         path: Arc<str>,
     ) -> Result<H3ClientStream, NetError> {
-        let quic_connection = connect_quic(
-            name_server,
-            server_name.clone(),
-            ALPN_H3,
-            match self.crypto_config {
-                Some(crypto_config) => crypto_config,
-                None => client_config()?,
-            },
-            self.transport_config,
-            endpoint,
+        let quic_connection = timeout(
+            self.connect_timeout,
+            connect_quic(
+                name_server,
+                server_name.clone(),
+                ALPN_H3,
+                match self.crypto_config {
+                    Some(crypto_config) => crypto_config,
+                    None => client_config()?,
+                },
+                self.transport_config,
+                endpoint,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| NetError::Timeout)??;
 
         let h3_connection = h3_quinn::Connection::new(quic_connection);
-        let (mut driver, send_request) = h3::client::builder()
-            .send_grease(!self.disable_grease)
-            .build(h3_connection)
-            .await
-            .map_err(|e| ProtoError::from(format!("h3 connection failed: {e}")))?;
+        let mut builder = h3::client::builder();
+        builder.send_grease(!self.disable_grease);
+        let future = builder.build(h3_connection);
+        let (mut driver, send_request) = match timeout(self.connect_timeout, future).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                return Err(ProtoError::from(format!("h3 connection failed: {e}")).into());
+            }
+            Err(_) => return Err(NetError::Timeout),
+        };
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -478,7 +487,6 @@ mod tests {
 
     use rustls::KeyLogFile;
     use test_support::subscribe;
-    use tokio::runtime::Runtime;
     use tokio::task::JoinSet;
 
     use super::*;
@@ -492,13 +500,13 @@ mod tests {
 
         let google = SocketAddr::from(([8, 8, 8, 8], 443));
         let mut request = Message::query();
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -519,24 +527,24 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::A(_)))
+                .any(|record| matches!(record.data, RData::A(_)))
         );
 
         //
         // assert that the connection works for a second query
         let mut request = Message::query();
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -548,9 +556,9 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::AAAA(_)))
+                .any(|record| matches!(record.data, RData::AAAA(_)))
         );
     }
 
@@ -560,13 +568,13 @@ mod tests {
 
         let google = SocketAddr::from(([8, 8, 8, 8], 443));
         let mut request = Message::query();
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -591,24 +599,24 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::A(_)))
+                .any(|record| matches!(record.data, RData::A(_)))
         );
 
         //
         // assert that the connection works for a second query
         let mut request = Message::query();
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -620,32 +628,32 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::AAAA(_)))
+                .any(|record| matches!(record.data, RData::AAAA(_)))
         );
     }
 
-    #[test]
-    fn test_h3_cloudflare() {
+    #[tokio::test]
+    async fn test_h3_cloudflare() {
         subscribe();
 
         let cloudflare = SocketAddr::from(([1, 1, 1, 1], 443));
         let mut request = Message::query();
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
         let mut client_config = client_config().unwrap();
         client_config.key_log = Arc::new(KeyLogFile::new());
 
-        let connect = H3ClientStream::builder()
+        let mut h3 = H3ClientStream::builder()
             .crypto_config(client_config)
             // Currently CF is using a broken GREASE implementation, see <https://github.com/hyperium/h3/issues/206>.
             .disable_grease(true)
@@ -653,48 +661,50 @@ mod tests {
                 cloudflare,
                 Arc::from("cloudflare-dns.com"),
                 Arc::from("/dns-query"),
-            );
+            )
+            .await
+            .expect("h3 connect failed");
 
-        // tokio runtime stuff...
-        let runtime = Runtime::new().expect("could not start runtime");
-        let mut h3 = runtime.block_on(connect).expect("h3 connect failed");
-
-        let response = runtime
-            .block_on(h3.send_message(request).first_answer())
+        let response = h3
+            .send_message(request)
+            .first_answer()
+            .await
             .expect("send_message failed");
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::A(_)))
+                .any(|record| matches!(record.data, RData::A(_)))
         );
 
         //
         // assert that the connection works for a second query
         let mut request = Message::query();
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
-        let response = runtime
-            .block_on(h3.send_message(request).first_answer())
+        let response = h3
+            .send_message(request)
+            .first_answer()
+            .await
             .expect("send_message failed");
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::AAAA(_)))
+                .any(|record| matches!(record.data, RData::AAAA(_)))
         );
     }
 
@@ -717,7 +727,7 @@ mod tests {
 
         // prepare request
         let mut request = Message::query();
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );

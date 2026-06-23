@@ -45,11 +45,12 @@ async fn server_responder(mut server: QuicServer) {
         while let Some(stream) = conn.next().await {
             let mut stream = stream.expect("new client stream failed");
 
-            let client_message = stream.receive().await.expect("failed to receive");
+            let bytes = stream.receive_bytes().await.expect("failed to receive");
+            let client_message = Message::from_vec(&bytes).expect("failed to parse message");
 
-            // just response with the same message.
+            // just respond with the same message converted to a response.
             stream
-                .send(client_message.into_message())
+                .send(client_message.into_response())
                 .await
                 .expect("failed to send response")
         }
@@ -110,11 +111,11 @@ async fn test_quic_stream() {
 
     // create a test message, send and then receive...
     let mut message = Message::query();
-    message.add_query(Query::query(
+    message.add_query(Query::new(
         Name::from_str("www.example.test.").unwrap(),
         RecordType::AAAA,
     ));
-    message.set_id(0); // RFC: DNS over QUIC requires the Message ID to be 0
+    message.metadata.id = 0; // RFC: DNS over QUIC requires the Message ID to be 0
 
     // TODO: we should make the finalizer easier to call so this round-trip serialization isn't necessary.
     let bytes = message.to_vec().unwrap();
@@ -127,7 +128,7 @@ async fn test_quic_stream() {
         .expect("no response received")
         .expect("failed to read response");
 
-    assert_eq!(*response, message);
+    assert_eq!(*response, message.into_response());
 
     // and finally kill the server
     server_join.abort();

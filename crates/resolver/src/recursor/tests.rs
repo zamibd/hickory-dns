@@ -37,10 +37,10 @@ async fn recursor_connection_deduplication() -> Result<(), NetError> {
     // is used in two separate zones.
     for query in [query_name, dup_query_name] {
         let response = recursor
-            .resolve(Query::query(query, RecordType::A), Instant::now(), false)
+            .resolve(Query::new(query, RecordType::A), Instant::now(), false)
             .await?;
 
-        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.response_code, ResponseCode::NoError);
 
         assert_eq!(
             provider.count_new_connection_calls(ROOT_IP, Protocol::Tcp),
@@ -76,14 +76,10 @@ async fn recursor_connection_deduplication_non_cached() -> Result<(), NetError> 
     )?;
 
     let response = recursor
-        .resolve(
-            Query::query(query_name, RecordType::A),
-            Instant::now(),
-            false,
-        )
+        .resolve(Query::new(query_name, RecordType::A), Instant::now(), false)
         .await?;
 
-    assert_eq!(response.response_code(), ResponseCode::NoError);
+    assert_eq!(response.response_code, ResponseCode::NoError);
     assert_eq!(
         provider.count_new_connection_calls(ROOT_IP, Protocol::Tcp),
         1
@@ -102,14 +98,14 @@ async fn recursor_connection_deduplication_non_cached() -> Result<(), NetError> 
     // connection cache.
     let response = recursor
         .resolve(
-            Query::query(dup_query_name, RecordType::A),
+            Query::new(dup_query_name, RecordType::A),
             Instant::now(),
             false,
         )
         .await
         .unwrap();
 
-    assert_eq!(response.response_code(), ResponseCode::NoError);
+    assert_eq!(response.response_code, ResponseCode::NoError);
     // Roots aren't subject to cache expiration
     assert_eq!(
         provider.count_new_connection_calls(ROOT_IP, Protocol::Tcp),
@@ -277,11 +273,13 @@ async fn name_server_cache_ttl_glue() -> Result<(), NetError> {
     let response = ttl_lookup(&recursor, &query_2_name).await?;
     assert!(validate_response(response, &query_2_name, target_2_ip_1));
 
-    // Query the names again after pausing for 2 * the glue record ttl, which should
-    // force the recursor to discard the cached zone and query again.  The TLD
-    // server will return a different nameserver on the second query which will
-    // in turn provide different answers to the A queries.
-    let _ = TokioTime::advance(Duration::from_secs((ns_ttl * 2) as u64)).await;
+    // Query the names again after pausing for 2 * the NS record (zone) ttl.
+    // The cache lifetime is derived from the NS record TTL, not the glue
+    // record TTL, so we must wait past zone_ttl for the entry to expire and
+    // force the recursor to re-query the TLD server.  The TLD server will
+    // return a different nameserver on the second query which will in turn
+    // provide different answers to the A queries.
+    let _ = TokioTime::advance(Duration::from_secs((zone_ttl * 2) as u64)).await;
 
     let response = ttl_lookup(&recursor, &query_1_name).await?;
     assert!(validate_response(response, &query_1_name, target_1_ip_2));
@@ -460,7 +458,7 @@ async fn not_fully_qualified_domain_name_in_query() -> Result<(), NetError> {
 
     let name = Name::from_ascii("example.com")?;
     assert!(!name.is_fqdn());
-    let query = Query::query(name, RecordType::A);
+    let query = Query::new(name, RecordType::A);
     let res = recursor
         .resolve(query, Instant::now(), false)
         .await
@@ -517,7 +515,7 @@ async fn cache_negative_responses() -> Result<(), NetError> {
     for _ in 0..2 {
         let response = recursor
             .resolve(
-                Query::query(no_exist_name.clone(), RecordType::A),
+                Query::new(no_exist_name.clone(), RecordType::A),
                 Instant::now(),
                 false,
             )
@@ -528,7 +526,7 @@ async fn cache_negative_responses() -> Result<(), NetError> {
             provider
                 .queries(&LEAF_IP)
                 .iter()
-                .filter(|x| x.name() == &no_exist_name && x.query_type() == RecordType::A)
+                .filter(|x| x.name == no_exist_name && x.query_type == RecordType::A)
                 .count(),
             1,
         );
@@ -674,15 +672,15 @@ fn ns_cache_test_fixture(
     let handler = MockNetworkHandler::new(responses).with_mutation(Box::new(
         move |destination: IpAddr, _protocol: Protocol, msg: &mut Message| {
             let leaf_ns = leaf_ns.clone();
-            let query_name = msg.queries()[0].name();
-            let query_type = msg.queries()[0].query_type();
+            let query_name = &msg.queries[0].name;
+            let query_type = msg.queries[0].query_type;
 
             if !off_domain {
                 if destination == TLD_IP && *query_name == leaf_zone && query_type == RecordType::NS
                 {
                     let count = counter.fetch_add(1, Ordering::Relaxed);
                     if count > 0 {
-                        let _ = msg.take_additionals();
+                        msg.additionals.clear();
                         msg.add_additional(Record::from_rdata(leaf_ns, ns_ttl, leaf_2_ip.into()));
                     }
                 }
@@ -692,7 +690,7 @@ fn ns_cache_test_fixture(
             {
                 let count = counter.fetch_add(1, Ordering::Relaxed);
                 if count > 0 {
-                    let _ = msg.take_answers();
+                    msg.answers.clear();
                     msg.add_answer(Record::from_rdata(leaf_ns, zone_ttl, leaf_2_ip.into()));
                 }
             }
@@ -716,7 +714,7 @@ async fn ttl_lookup(
 ) -> Result<Message, RecursorError> {
     recursor
         .resolve(
-            Query::query(name.clone(), RecordType::A),
+            Query::new(name.clone(), RecordType::A),
             TokioTime::Instant::now().into(),
             false,
         )
@@ -724,8 +722,8 @@ async fn ttl_lookup(
 }
 
 fn validate_response(response: Message, name: &Name, ip: IpAddr) -> bool {
-    response.response_code() == ResponseCode::NoError
-        && response.answers() == [Record::from_rdata(name.clone(), 0, ip.into())]
+    response.response_code == ResponseCode::NoError
+        && response.answers == [Record::from_rdata(name.clone(), 0, ip.into())]
 }
 
 fn test_fixture() -> Result<(MockProvider, RecursorOptions), NetError> {
@@ -762,7 +760,7 @@ fn test_fixture() -> Result<(MockProvider, RecursorOptions), NetError> {
     let handler = MockNetworkHandler::new(responses).with_mutation(Box::new(
         |_destination: IpAddr, protocol: Protocol, msg: &mut Message| {
             if protocol == Protocol::Udp {
-                msg.set_truncated(true);
+                msg.metadata.truncation = true;
             }
         },
     ));
@@ -851,13 +849,13 @@ mod metrics {
                 for _ in 0..3 {
                     let response = recursor
                         .resolve(
-                            Query::query(query_name.clone(), RecordType::A),
+                            Query::new(query_name.clone(), RecordType::A),
                             Instant::now(),
                             false,
                         )
                         .await
                         .unwrap();
-                    assert_eq!(response.response_code(), ResponseCode::NoError);
+                    assert_eq!(response.response_code, ResponseCode::NoError);
                 }
             });
         });
@@ -875,13 +873,7 @@ mod metrics {
             assert_counter_eq(&map, OUTGOING_QUERIES_TOTAL, vec![], 3);
             assert_counter_eq(&map, CACHE_HIT_TOTAL, vec![], 2);
             assert_counter_eq(&map, CACHE_MISS_TOTAL, vec![], 1);
-            assert_histogram_sample_count_eq(
-                &map,
-                CACHE_HIT_DURATION,
-                vec![],
-                2,
-                Unit::Milliseconds,
-            );
+            assert_histogram_sample_count_eq(&map, CACHE_HIT_DURATION, vec![], 2, Unit::Seconds);
             assert_histogram_sample_count_eq(&map, CACHE_MISS_DURATION, vec![], 1, Unit::Seconds);
 
             assert_gauge_eq(&map, RESPONSE_CACHE_SIZE, vec![], 3);
@@ -895,13 +887,7 @@ mod metrics {
             assert_counter_eq(&map, OUTGOING_QUERIES_TOTAL, vec![], 4);
             assert_counter_eq(&map, CACHE_HIT_TOTAL, vec![], 5);
             assert_counter_eq(&map, CACHE_MISS_TOTAL, vec![], 2);
-            assert_histogram_sample_count_eq(
-                &map,
-                CACHE_HIT_DURATION,
-                vec![],
-                3,
-                Unit::Milliseconds,
-            );
+            assert_histogram_sample_count_eq(&map, CACHE_HIT_DURATION, vec![], 3, Unit::Seconds);
             assert_histogram_sample_count_eq(&map, CACHE_MISS_DURATION, vec![], 1, Unit::Seconds);
 
             // When validating DNSSEC, we should also see DNSSEC-specific metrics.

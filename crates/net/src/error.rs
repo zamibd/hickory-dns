@@ -9,6 +9,8 @@
 
 #![deny(missing_docs)]
 
+#[cfg(target_os = "android")]
+use core::error::Error;
 use core::num::ParseIntError;
 use std::io;
 use std::sync::Arc;
@@ -23,17 +25,13 @@ use crate::proto::ProtoError;
 use crate::proto::dnssec::Proof;
 use crate::proto::op::{DnsResponse, Query, ResponseCode};
 use crate::proto::rr::RData;
-use crate::proto::rr::{Record, RecordType, rdata::SOA, resource::RecordRef};
+use crate::proto::rr::{Record, RecordRef, RecordType, rdata::SOA};
+use crate::proto::serialize::binary::DecodeError;
 
 /// The error type for network protocol errors (UDP, TCP, QUIC, H2, H3)
 #[non_exhaustive]
 #[derive(Error, Clone, Debug)]
 pub enum NetError {
-    /// A UDP response was received with an incorrect transaction id, likely indicating a
-    /// cache-poisoning attempt.
-    #[error("bad transaction id received")]
-    BadTransactionId,
-
     /// The underlying resource is too busy
     ///
     /// This is a signal that an internal resource is too busy. The intended action should be tried
@@ -85,6 +83,11 @@ pub enum NetError {
     /// An error got returned from IO
     #[error("io error: {0}")]
     Io(Arc<io::Error>),
+
+    /// Error from JNI calls on Android
+    #[cfg(target_os = "android")]
+    #[error("JNI error: {0}")]
+    Jni(Arc<dyn Error + Send + Sync>),
 
     /// A request timed out
     #[error("request timed out")]
@@ -165,6 +168,36 @@ impl NetError {
         matches!(self, Self::Dns(DnsError::NoRecordsFound { .. }))
     }
 
+    /// Returns true for a transport-level connection error: the connection was
+    /// closed, reset, or refused, as opposed to a timeout or a server-side (DNS)
+    /// error.
+    pub fn is_connection_closed(&self) -> bool {
+        match self {
+            #[cfg(feature = "__https")]
+            Self::H2(err) => {
+                err.is_io() || err.is_go_away() || err.reason() == Some(h2::Reason::REFUSED_STREAM)
+            }
+            #[cfg(feature = "__h3")]
+            Self::H3(err) => err.is_h3_no_error(),
+            Self::Io(err) => matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+            ),
+            #[cfg(feature = "__quic")]
+            Self::QuinnConnection(err) => matches!(
+                err,
+                quinn::ConnectionError::ConnectionClosed(_)
+                    | quinn::ConnectionError::ApplicationClosed(_)
+                    | quinn::ConnectionError::Reset
+            ),
+            _ => false,
+        }
+    }
+
     /// Returns the SOA record, if the error contains one
     #[inline]
     pub fn into_soa(self) -> Option<Box<Record<SOA>>> {
@@ -178,6 +211,12 @@ impl NetError {
 impl From<NoRecords> for NetError {
     fn from(no_records: NoRecords) -> Self {
         Self::Dns(DnsError::NoRecordsFound(no_records))
+    }
+}
+
+impl From<DecodeError> for NetError {
+    fn from(e: DecodeError) -> Self {
+        Self::Proto(e.into())
     }
 }
 
@@ -253,7 +292,7 @@ impl DnsError {
         use ResponseCode::*;
         debug!("response: {}", *response);
 
-        match response.response_code() {
+        match response.response_code {
                 Refused => Err(Self::ResponseCode(Refused)),
                 code @ ServFail
                 | code @ FormErr
@@ -276,20 +315,20 @@ impl DnsError {
                 code @ NXDomain |
                 // No answers are available, CNAME referrals are not failures
                 code @ NoError
-                if !response.contains_answer() && !response.truncated() => {
+                if !response.contains_answer() && !response.truncation => {
                     // TODO: if authoritative, this is cacheable, store a TTL (currently that requires time, need a "now" here)
                     // let valid_until = if response.authoritative() { now + response.negative_ttl() };
                     let soa = response.soa().as_ref().map(RecordRef::to_owned);
 
                     // Collect any referral nameservers and associated glue records
                     let mut referral_name_servers = vec![];
-                    for ns in response.authorities().iter().filter(|ns| ns.record_type() == RecordType::NS) {
+                    for ns in response.authorities.iter().filter(|ns| ns.record_type() == RecordType::NS) {
                         let glue = response
-                            .additionals()
+                            .additionals
                             .iter()
                             .filter_map(|record| {
-                                if let RData::NS(ns_data) = ns.data() {
-                                    if *record.name() == **ns_data && matches!(record.data(), RData::A(_) | RData::AAAA(_)) {
+                                if let RData::NS(ns_data) = &ns.data {
+                                    if record.name == **ns_data && matches!(&record.data, RData::A(_) | RData::AAAA(_)) {
                                         return Some(Record::to_owned(record));
                                     }
                                 }
@@ -306,14 +345,14 @@ impl DnsError {
                         None
                     };
 
-                    let authorities = if !response.authorities().is_empty() {
-                        Some(response.authorities().to_owned().into())
+                    let authorities = if !response.authorities.is_empty() {
+                        Some(response.authorities.to_owned().into())
                     } else {
                         None
                     };
 
                     let negative_ttl = response.negative_ttl();
-                    let query = response.into_message().take_queries().drain(..).next().unwrap_or_default();
+                    let query = response.into_message().queries.drain(..).next().unwrap_or_else(Query::root);
 
                     Err(Self::NoRecordsFound(NoRecords {
                         query: Box::new(query),
@@ -373,4 +412,52 @@ pub struct ForwardNSData {
     pub ns: Record,
     /// Any glue records associated with the referant NS record.
     pub glue: Arc<[Record]>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_connection_closed_io_kinds() {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                NetError::from(io::Error::from(kind)).is_connection_closed(),
+                "{kind:?}"
+            );
+        }
+
+        assert!(
+            !NetError::from(io::Error::from(io::ErrorKind::PermissionDenied))
+                .is_connection_closed()
+        );
+        assert!(!NetError::Timeout.is_connection_closed());
+        assert!(!NetError::Message("server error").is_connection_closed());
+    }
+
+    #[cfg(feature = "__https")]
+    #[test]
+    fn is_connection_closed_h2() {
+        // REFUSED_STREAM: the server never processed the request, so it's safe to retry.
+        assert!(NetError::from(h2::Error::from(h2::Reason::REFUSED_STREAM)).is_connection_closed());
+        // A protocol error mid-exchange is not a clean connection-closed signal.
+        assert!(
+            !NetError::from(h2::Error::from(h2::Reason::INTERNAL_ERROR)).is_connection_closed()
+        );
+    }
+
+    #[cfg(feature = "__quic")]
+    #[test]
+    fn is_connection_closed_quic_excludes_timeout() {
+        assert!(NetError::QuinnConnection(quinn::ConnectionError::Reset).is_connection_closed());
+        assert!(
+            !NetError::QuinnConnection(quinn::ConnectionError::TimedOut).is_connection_closed()
+        );
+    }
 }

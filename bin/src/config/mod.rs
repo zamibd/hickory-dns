@@ -160,6 +160,94 @@ pub(crate) struct Config {
     /// Networks allowed to access the server
     #[serde(default)]
     pub(crate) allow_networks: Vec<IpNet>,
+    /// UDP socket configuration options.
+    #[serde(default)]
+    pub(crate) udp_socket: UdpSocketConfig,
+    /// TCP socket configuration options.
+    #[serde(default)]
+    pub(crate) tcp_socket: TcpSocketConfig,
+}
+
+/// Configuration options for UDP sockets.
+///
+/// These settings control the kernel buffer sizes for UDP sockets used by the DNS server.
+/// Under high query load, increasing buffer sizes can help prevent packet loss when the
+/// application cannot process incoming packets fast enough.
+///
+/// Note: The kernel may cap the actual buffer size based on system limits
+/// (e.g., `net.core.rmem_max` on Linux). Check logs at startup to see the actual
+/// buffer size that was configured.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UdpSocketConfig {
+    /// UDP socket receive buffer size in bytes.
+    ///
+    /// Controls the kernel buffer for incoming UDP packets. If not specified, the operating
+    /// system default is used. Larger values help absorb traffic bursts without dropping
+    /// packets.
+    pub(crate) recv_buffer_size: Option<usize>,
+    /// UDP socket send buffer size in bytes.
+    ///
+    /// Controls the kernel buffer for outgoing UDP packets. If not specified, the operating
+    /// system default is used. Larger values help when the server is sending many responses.
+    pub(crate) send_buffer_size: Option<usize>,
+    /// Number of UDP sockets to create per listen address (Unix only).
+    ///
+    /// Using multiple sockets with SO_REUSEPORT allows the kernel to distribute incoming packets
+    /// across sockets, which may improve performance under high load. Optimal values depend
+    /// on workload and setting it too high will have the opposite effect and cause performance
+    /// degradation.
+    ///
+    /// Defaults to 1.
+    #[cfg(unix)]
+    pub(crate) sockets: Option<usize>,
+}
+
+/// Configuration options for TCP sockets.
+///
+/// These settings control aspects of TCP listeners used by the DNS server.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TcpSocketConfig {
+    /// TCP listen backlog size.
+    ///
+    /// Controls the maximum number of pending connections queued by the kernel before
+    /// connections are refused. If not specified, defaults to 128.
+    ///
+    /// Higher values allow more connections to queue during traffic spikes.
+    /// Consider increasing this for high-TCP load deployments.
+    ///
+    /// On Linux the kernel `net.core.somaxconn` and `net.ipv[4|6].tcp_max_syn_backlog`
+    /// may also need adjustment to match.
+    #[serde(default = "default_tcp_listen_backlog")]
+    pub(crate) listen_backlog: i32,
+
+    /// TCP response buffer size.
+    ///
+    /// Controls the maximum number of DNS responses that can be queued for
+    /// sending on a single TCP connection. Under high query rates, a larger
+    /// buffer prevents responses from being dropped due to backpressure.
+    ///
+    /// If not specified, defaults to 32.
+    #[serde(default = "default_tcp_response_buffer_size")]
+    pub(crate) response_buffer_size: usize,
+}
+
+impl Default for TcpSocketConfig {
+    fn default() -> Self {
+        Self {
+            listen_backlog: default_tcp_listen_backlog(),
+            response_buffer_size: default_tcp_response_buffer_size(),
+        }
+    }
+}
+
+fn default_tcp_listen_backlog() -> i32 {
+    128
+}
+
+fn default_tcp_response_buffer_size() -> usize {
+    32
 }
 
 impl Config {

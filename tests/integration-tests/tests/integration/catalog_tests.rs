@@ -7,7 +7,7 @@ use hickory_net::{
 use hickory_proto::{
     op::{Edns, Message, MessageType, OpCode, Query, ResponseCode},
     rr::{
-        DNSClass, LowerName, Name, RData, Record, RecordType,
+        LowerName, Name, RData, Record, RecordType,
         rdata::{
             A, AAAA, CNAME, NS, SOA,
             opt::{EdnsCode, EdnsOption, NSIDPayload},
@@ -47,9 +47,7 @@ fn create_records(records: &mut InMemoryZoneHandler) {
                 1209600,
                 3600,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         0,
     );
 
@@ -58,9 +56,7 @@ fn create_records(records: &mut InMemoryZoneHandler) {
             origin.clone(),
             86400,
             RData::NS(NS(Name::parse("a.iana-servers.net.", None).unwrap())),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         0,
     );
     records.upsert_mut(
@@ -68,16 +64,12 @@ fn create_records(records: &mut InMemoryZoneHandler) {
             origin.clone(),
             86400,
             RData::NS(NS(Name::parse("b.iana-servers.net.", None).unwrap())),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         0,
     );
 
     records.upsert_mut(
-        Record::from_rdata(origin.clone(), 86400, RData::A(A::new(94, 184, 216, 34)))
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+        Record::from_rdata(origin.clone(), 86400, RData::A(A::new(94, 184, 216, 34))),
         0,
     );
     records.upsert_mut(
@@ -87,17 +79,13 @@ fn create_records(records: &mut InMemoryZoneHandler) {
             RData::AAAA(AAAA::new(
                 0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         0,
     );
 
     let www_name = Name::parse("www.test.com.", None).unwrap();
     records.upsert_mut(
-        Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(94, 184, 216, 34)))
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+        Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(94, 184, 216, 34))),
         0,
     );
     records.upsert_mut(
@@ -107,9 +95,7 @@ fn create_records(records: &mut InMemoryZoneHandler) {
             RData::AAAA(AAAA::new(
                 0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         0,
     );
 }
@@ -145,7 +131,7 @@ async fn test_catalog_lookup() {
 
     let mut question = Message::query();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(origin.into());
 
     question.add_query(query);
@@ -166,25 +152,25 @@ async fn test_catalog_lookup() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.response_code(), ResponseCode::NoError);
-    assert_eq!(result.message_type(), MessageType::Response);
-    assert!(result.header().authoritative());
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert!(result.metadata.authoritative);
 
-    let answers = result.answers();
+    let answers = result.answers;
 
     assert!(!answers.is_empty());
     assert_eq!(answers.first().unwrap().record_type(), RecordType::A);
     assert_eq!(
-        answers.first().unwrap().data(),
-        &RData::A(A::new(93, 184, 215, 14))
+        answers.first().unwrap().data,
+        RData::A(A::new(93, 184, 215, 14))
     );
 
-    let authorities = result.authorities();
+    let authorities = result.authorities;
     assert!(authorities.is_empty());
 
     // other zone
     let mut question = Message::query();
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(test_origin.into());
 
     question.add_query(query);
@@ -205,17 +191,17 @@ async fn test_catalog_lookup() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.response_code(), ResponseCode::NoError);
-    assert_eq!(result.message_type(), MessageType::Response);
-    assert!(result.header().authoritative());
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert!(result.metadata.authoritative);
 
-    let answers = result.answers();
+    let answers = result.answers;
 
     assert!(!answers.is_empty());
     assert_eq!(answers.first().unwrap().record_type(), RecordType::A);
     assert_eq!(
-        answers.first().unwrap().data(),
-        &RData::A(A::new(94, 184, 216, 34))
+        answers.first().unwrap().data,
+        RData::A(A::new(94, 184, 216, 34))
     );
 }
 
@@ -234,7 +220,7 @@ async fn test_catalog_lookup_soa() {
 
     let mut question = Message::query();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(origin.into());
     query.set_query_type(RecordType::SOA);
 
@@ -256,17 +242,17 @@ async fn test_catalog_lookup_soa() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.response_code(), ResponseCode::NoError);
-    assert_eq!(result.message_type(), MessageType::Response);
-    assert!(result.header().authoritative());
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert!(result.metadata.authoritative);
 
-    let answers = result.answers();
+    let answers = result.answers;
 
     assert!(!answers.is_empty());
     assert_eq!(answers.first().unwrap().record_type(), RecordType::SOA);
     assert_eq!(
-        answers.first().unwrap().data(),
-        &RData::SOA(SOA::new(
+        answers.first().unwrap().data,
+        RData::SOA(SOA::new(
             Name::parse("sns.dns.icann.org.", None).unwrap(),
             Name::parse("noc.dns.icann.org.", None).unwrap(),
             2015082403,
@@ -278,19 +264,19 @@ async fn test_catalog_lookup_soa() {
     );
 
     // assert SOA requests get NS records
-    let mut ns = result.authorities().to_vec();
+    let mut ns = result.authorities;
     ns.sort();
 
     assert_eq!(ns.len(), 2);
     assert_eq!(ns.first().unwrap().record_type(), RecordType::NS);
     assert_eq!(
-        ns.first().unwrap().data(),
-        &RData::NS(NS(Name::parse("a.iana-servers.net.", None).unwrap()))
+        ns.first().unwrap().data,
+        RData::NS(NS(Name::parse("a.iana-servers.net.", None).unwrap()))
     );
     assert_eq!(ns.last().unwrap().record_type(), RecordType::NS);
     assert_eq!(
-        ns.last().unwrap().data(),
-        &RData::NS(NS(Name::parse("b.iana-servers.net.", None).unwrap()))
+        ns.last().unwrap().data,
+        RData::NS(NS(Name::parse("b.iana-servers.net.", None).unwrap()))
     );
 }
 
@@ -307,7 +293,7 @@ async fn test_catalog_nx_soa() {
 
     let mut question = Message::query();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(Name::parse("nx.example.com.", None).unwrap());
 
     question.add_query(query);
@@ -328,17 +314,75 @@ async fn test_catalog_nx_soa() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.response_code(), ResponseCode::NXDomain);
-    assert_eq!(result.message_type(), MessageType::Response);
-    assert!(result.header().authoritative());
+    assert_eq!(result.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert!(result.metadata.authoritative);
 
-    let authorities = result.authorities();
+    let authorities = result.authorities;
 
     assert_eq!(authorities.len(), 1);
     assert_eq!(authorities.first().unwrap().record_type(), RecordType::SOA);
     assert_eq!(
-        authorities.first().unwrap().data(),
-        &RData::SOA(SOA::new(
+        authorities.first().unwrap().data,
+        RData::SOA(SOA::new(
+            Name::parse("sns.dns.icann.org.", None).unwrap(),
+            Name::parse("noc.dns.icann.org.", None).unwrap(),
+            2015082403,
+            7200,
+            3600,
+            1209600,
+            3600,
+        ))
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::unreadable_literal)]
+async fn test_catalog_soa_query_for_nx_name() {
+    subscribe();
+
+    let example = create_example();
+    let origin = example.origin().clone();
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(origin, vec![Arc::new(example)]);
+
+    let mut question = Message::query();
+
+    let mut query = Query::root();
+    query.set_name(Name::parse("nx.example.com.", None).unwrap());
+    query.set_query_type(RecordType::SOA);
+
+    question.add_query(query);
+
+    // temp request
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Udp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+
+    assert_eq!(result.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert!(result.metadata.authoritative);
+    assert!(result.answers.is_empty());
+
+    let authorities = result.authorities;
+
+    assert_eq!(authorities.len(), 1);
+    assert_eq!(authorities.first().unwrap().record_type(), RecordType::SOA);
+    assert_eq!(
+        authorities.first().unwrap().data,
+        RData::SOA(SOA::new(
             Name::parse("sns.dns.icann.org.", None).unwrap(),
             Name::parse("noc.dns.icann.org.", None).unwrap(),
             2015082403,
@@ -362,7 +406,7 @@ async fn test_non_authoritive_nx_refused() {
 
     let mut question = Message::query();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(Name::parse("com.", None).unwrap());
     query.set_query_type(RecordType::SOA);
 
@@ -384,13 +428,13 @@ async fn test_non_authoritive_nx_refused() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.response_code(), ResponseCode::Refused);
-    assert_eq!(result.message_type(), MessageType::Response);
-    assert!(!result.header().authoritative());
+    assert_eq!(result.metadata.response_code, ResponseCode::Refused);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert!(!result.metadata.authoritative);
 
-    assert_eq!(result.authorities().len(), 0);
-    assert_eq!(result.answers().len(), 0);
-    assert_eq!(result.additionals().len(), 0);
+    assert_eq!(result.authorities.len(), 0);
+    assert_eq!(result.answers.len(), 0);
+    assert_eq!(result.additionals.len(), 0);
 }
 
 #[tokio::test]
@@ -414,14 +458,12 @@ async fn test_axfr_allow_all() {
             1209600,
             3600,
         )),
-    )
-    .set_dns_class(DNSClass::IN)
-    .clone();
+    );
 
     let mut catalog = Catalog::new();
     catalog.upsert(origin.clone(), vec![Arc::new(test)]);
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(origin.clone().into());
     query.set_query_type(RecordType::AXFR);
 
@@ -444,7 +486,7 @@ async fn test_axfr_allow_all() {
         .await;
     let result = response_handler.into_message().await;
 
-    let mut answers = result.answers().to_vec();
+    let mut answers = result.answers;
 
     assert_eq!(answers.first().expect("no records found?"), &soa);
     assert_eq!(answers.last().expect("no records found?"), &soa);
@@ -465,51 +507,37 @@ async fn test_axfr_allow_all() {
                 1209600,
                 3600,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         Record::from_rdata(
             origin.clone().into(),
             86400,
             RData::NS(NS(Name::parse("a.iana-servers.net.", None).unwrap())),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         Record::from_rdata(
             origin.clone().into(),
             86400,
             RData::NS(NS(Name::parse("b.iana-servers.net.", None).unwrap())),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         Record::from_rdata(
             origin.clone().into(),
             86400,
             RData::A(A::new(94, 184, 216, 34)),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         Record::from_rdata(
             origin.clone().into(),
             86400,
             RData::AAAA(AAAA::new(
                 0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
-        Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(94, 184, 216, 34)))
-            .set_dns_class(DNSClass::IN)
-            .clone(),
+        ),
+        Record::from_rdata(www_name.clone(), 86400, RData::A(A::new(94, 184, 216, 34))),
         Record::from_rdata(
             www_name,
             86400,
             RData::AAAA(AAAA::new(
                 0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         Record::from_rdata(
             origin.into(),
             3600,
@@ -522,9 +550,7 @@ async fn test_axfr_allow_all() {
                 1209600,
                 3600,
             )),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
     ];
 
     expected_set.sort();
@@ -544,7 +570,7 @@ async fn test_axfr_deny_all() {
     let mut catalog = Catalog::new();
     catalog.upsert(origin.clone(), vec![Arc::new(test)]);
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(origin.into());
     query.set_query_type(RecordType::AXFR);
 
@@ -567,10 +593,10 @@ async fn test_axfr_deny_all() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.response_code(), ResponseCode::Refused);
-    assert!(result.answers().is_empty());
-    assert!(result.authorities().is_empty());
-    assert!(result.additionals().is_empty());
+    assert_eq!(result.metadata.response_code, ResponseCode::Refused);
+    assert!(result.answers.is_empty());
+    assert!(result.authorities.is_empty());
+    assert!(result.additionals.is_empty());
 }
 
 #[cfg(feature = "sqlite")]
@@ -586,7 +612,7 @@ async fn test_axfr_deny_all_sqlite() {
     let mut catalog = Catalog::new();
     catalog.upsert(origin.clone(), vec![Arc::new(handler)]);
 
-    let query = Query::query(origin.into(), RecordType::AXFR);
+    let query = Query::new(origin.into(), RecordType::AXFR);
     let mut message = Message::query();
     message.add_query(query);
 
@@ -605,10 +631,10 @@ async fn test_axfr_deny_all_sqlite() {
         .await;
     let response = response_handler.into_message().await;
 
-    assert_eq!(response.response_code(), ResponseCode::Refused);
-    assert!(response.answers().is_empty());
-    assert!(response.authorities().is_empty());
-    assert!(response.additionals().is_empty());
+    assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+    assert!(response.answers.is_empty());
+    assert!(response.authorities.is_empty());
+    assert!(response.additionals.is_empty());
 }
 
 #[tokio::test]
@@ -624,7 +650,7 @@ async fn test_axfr_deny_unsigned() {
     let mut catalog = Catalog::new();
     catalog.upsert(origin.clone(), vec![Arc::new(test)]);
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(origin.into());
     query.set_query_type(RecordType::AXFR);
 
@@ -647,10 +673,10 @@ async fn test_axfr_deny_unsigned() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.response_code(), ResponseCode::Refused);
-    assert!(result.answers().is_empty());
-    assert!(result.authorities().is_empty());
-    assert!(result.additionals().is_empty());
+    assert_eq!(result.metadata.response_code, ResponseCode::Refused);
+    assert!(result.answers.is_empty());
+    assert!(result.authorities.is_empty());
+    assert!(result.additionals.is_empty());
 }
 
 // Test that requesting NSID produces no NSID response when a payload isn't configured.
@@ -671,13 +697,10 @@ async fn test_nsid_disabled_requested() {
         .handle_request::<_, TokioTime>(&question_req, response_handler.clone())
         .await;
     let response = response_handler.into_message().await;
-    assert_eq!(response.response_code(), ResponseCode::NoError);
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
 
     // We sent EDNS in the request, and so expect to find EDNS in the response.
-    let edns = response
-        .extensions()
-        .as_ref()
-        .expect("missing response EDNS");
+    let edns = response.edns.as_ref().expect("missing response EDNS");
     // We shouldn't find an NSID payload in the response EDNS even though we requested it
     // The catalog had no payload configured.
     assert!(
@@ -707,13 +730,10 @@ async fn test_nsid_enabled_not_requested() {
         .handle_request::<_, TokioTime>(&question_req, response_handler.clone())
         .await;
     let response = response_handler.into_message().await;
-    assert_eq!(response.response_code(), ResponseCode::NoError);
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
 
     // We sent EDNS in the request, and so expect to find EDNS in the response.
-    let edns = response
-        .extensions()
-        .as_ref()
-        .expect("missing response EDNS");
+    let edns = response.edns.as_ref().expect("missing response EDNS");
     // We shouldn't find an NSID payload in the response EDNS - we didn't request it.
     assert!(
         edns.option(EdnsCode::NSID).is_none(),
@@ -744,19 +764,16 @@ async fn test_nsid_enabled_and_requested() {
         .handle_request::<_, TokioTime>(&question_req, response_handler.clone())
         .await;
     let response = response_handler.into_message().await;
-    assert_eq!(response.response_code(), ResponseCode::NoError);
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
 
     // We sent EDNS in the request, and so expect to find EDNS in the response.
-    let edns = response
-        .extensions()
-        .as_ref()
-        .expect("missing response EDNS");
+    let edns = response.edns.as_ref().expect("missing response EDNS");
     // We should find the expected EDNS NSID payload.
     assert_eq!(edns.option(EdnsCode::NSID), Some(&EdnsOption::NSID(nsid)));
 }
 
 fn test_nsid_request(origin: LowerName, request_nsid: bool) -> Request {
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(origin.into());
     query.set_query_type(RecordType::A);
 
@@ -794,7 +811,7 @@ async fn test_cname_additionals() {
 
     let mut question = Message::query();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(Name::from_str("alias.example.com.").unwrap());
     query.set_query_type(RecordType::A);
 
@@ -816,23 +833,23 @@ async fn test_cname_additionals() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.message_type(), MessageType::Response);
-    assert_eq!(result.response_code(), ResponseCode::NoError);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
 
-    let answers = result.answers();
+    let answers = result.answers;
     assert_eq!(answers.len(), 1);
     assert_eq!(answers.first().unwrap().record_type(), RecordType::CNAME);
     assert_eq!(
-        answers.first().unwrap().data(),
-        &RData::CNAME(CNAME(Name::from_str("www.example.com.").unwrap()))
+        answers.first().unwrap().data,
+        RData::CNAME(CNAME(Name::from_str("www.example.com.").unwrap()))
     );
 
-    let additionals = result.additionals();
+    let additionals = result.additionals;
     assert!(!additionals.is_empty());
     assert_eq!(additionals.first().unwrap().record_type(), RecordType::A);
     assert_eq!(
-        additionals.first().unwrap().data(),
-        &RData::A(A::new(93, 184, 215, 14))
+        additionals.first().unwrap().data,
+        RData::A(A::new(93, 184, 215, 14))
     );
 }
 
@@ -848,7 +865,7 @@ async fn test_multiple_cname_additionals() {
 
     let mut question = Message::query();
 
-    let mut query = Query::new();
+    let mut query = Query::root();
     query.set_name(Name::from_str("alias2.example.com.").unwrap());
     query.set_query_type(RecordType::A);
 
@@ -870,36 +887,35 @@ async fn test_multiple_cname_additionals() {
         .await;
     let result = response_handler.into_message().await;
 
-    assert_eq!(result.message_type(), MessageType::Response);
-    assert_eq!(result.response_code(), ResponseCode::NoError);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
 
-    let answers = result.answers();
+    let answers = result.answers;
     assert_eq!(answers.len(), 1);
     assert_eq!(answers.first().unwrap().record_type(), RecordType::CNAME);
     assert_eq!(
-        answers.first().unwrap().data(),
-        &RData::CNAME(CNAME(Name::from_str("alias.example.com.").unwrap()))
+        answers.first().unwrap().data,
+        RData::CNAME(CNAME(Name::from_str("alias.example.com.").unwrap()))
     );
 
     // we should have the intermediate record
-    let additionals = result.additionals();
+    let additionals = result.additionals;
     assert!(!additionals.is_empty());
     assert_eq!(
         additionals.first().unwrap().record_type(),
         RecordType::CNAME
     );
     assert_eq!(
-        additionals.first().unwrap().data(),
-        &RData::CNAME(CNAME(Name::from_str("www.example.com.").unwrap()))
+        additionals.first().unwrap().data,
+        RData::CNAME(CNAME(Name::from_str("www.example.com.").unwrap()))
     );
 
     // final record should be the actual
-    let additionals = result.additionals();
     assert!(!additionals.is_empty());
     assert_eq!(additionals.last().unwrap().record_type(), RecordType::A);
     assert_eq!(
-        additionals.last().unwrap().data(),
-        &RData::A(A::new(93, 184, 215, 14))
+        additionals.last().unwrap().data,
+        RData::A(A::new(93, 184, 215, 14))
     );
 }
 
@@ -909,7 +925,7 @@ async fn test_update_forwarder() {
 
     let handler = ForwardZoneHandler::builder_tokio(ForwardConfig {
         name_servers: Vec::new(),
-        options: None,
+        ..ForwardConfig::default()
     })
     .build()
     .unwrap();
@@ -917,7 +933,7 @@ async fn test_update_forwarder() {
     let mut catalog = Catalog::new();
     catalog.upsert(Name::root().into(), vec![Arc::new(handler)]);
 
-    let query = Query::query(Name::root(), RecordType::SOA);
+    let query = Query::new(Name::root(), RecordType::SOA);
     let mut message = Message::new(0, MessageType::Query, OpCode::Update);
     message.add_query(query);
     message.add_answer(Record::from_rdata(
@@ -925,7 +941,7 @@ async fn test_update_forwarder() {
         86400,
         RData::A(A(Ipv4Addr::LOCALHOST)),
     ));
-    message.set_recursion_desired(true);
+    message.metadata.recursion_desired = true;
 
     let message_bytes = message.to_bytes().unwrap();
     let request =
@@ -937,10 +953,10 @@ async fn test_update_forwarder() {
         .await;
     let response = response_handler.into_message().await;
 
-    assert_eq!(response.response_code(), ResponseCode::NotAuth);
-    assert!(response.answers().is_empty());
-    assert!(response.authorities().is_empty());
-    assert!(response.additionals().is_empty());
+    assert_eq!(response.metadata.response_code, ResponseCode::NotAuth);
+    assert!(response.answers.is_empty());
+    assert!(response.authorities.is_empty());
+    assert!(response.additionals.is_empty());
 }
 
 #[tokio::test]
@@ -950,7 +966,7 @@ async fn test_empty_chain_query() {
     let mut catalog = Catalog::new();
     catalog.upsert(Name::root().into(), vec![]);
 
-    let query = Query::query(Name::root(), RecordType::SOA);
+    let query = Query::new(Name::root(), RecordType::SOA);
     let mut message = Message::new(0, MessageType::Query, OpCode::Query);
     message.add_query(query);
 
@@ -964,10 +980,10 @@ async fn test_empty_chain_query() {
         .await;
     let response = response_handler.into_message().await;
 
-    assert_eq!(response.response_code(), ResponseCode::ServFail);
-    assert!(response.answers().is_empty());
-    assert!(response.authorities().is_empty());
-    assert!(response.additionals().is_empty());
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert!(response.answers.is_empty());
+    assert!(response.authorities.is_empty());
+    assert!(response.additionals.is_empty());
 }
 
 #[tokio::test]
@@ -977,7 +993,7 @@ async fn test_empty_chain_update() {
     let mut catalog = Catalog::new();
     catalog.upsert(Name::root().into(), vec![]);
 
-    let query = Query::query(Name::root(), RecordType::SOA);
+    let query = Query::new(Name::root(), RecordType::SOA);
     let mut message = Message::new(0, MessageType::Query, OpCode::Update);
     message.add_query(query);
     message.add_answer(Record::from_rdata(
@@ -996,10 +1012,10 @@ async fn test_empty_chain_update() {
         .await;
     let response = response_handler.into_message().await;
 
-    assert_eq!(response.response_code(), ResponseCode::ServFail);
-    assert!(response.answers().is_empty());
-    assert!(response.authorities().is_empty());
-    assert!(response.additionals().is_empty());
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert!(response.answers.is_empty());
+    assert!(response.authorities.is_empty());
+    assert!(response.additionals.is_empty());
 }
 
 #[tokio::test]
@@ -1009,7 +1025,7 @@ async fn test_empty_chain_axfr() {
     let mut catalog = Catalog::new();
     catalog.upsert(Name::root().into(), vec![]);
 
-    let query = Query::query(Name::root(), RecordType::AXFR);
+    let query = Query::new(Name::root(), RecordType::AXFR);
     let mut message = Message::new(0, MessageType::Query, OpCode::Query);
     message.add_query(query);
 
@@ -1023,10 +1039,10 @@ async fn test_empty_chain_axfr() {
         .await;
     let response = response_handler.into_message().await;
 
-    assert_eq!(response.response_code(), ResponseCode::ServFail);
-    assert!(response.answers().is_empty());
-    assert!(response.authorities().is_empty());
-    assert!(response.additionals().is_empty());
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert!(response.answers.is_empty());
+    assert!(response.authorities.is_empty());
+    assert!(response.additionals.is_empty());
 }
 
 #[cfg(feature = "__dnssec")]
@@ -1077,10 +1093,7 @@ mod dnssec {
     async fn run_query(catalog: &Catalog, query: Query) -> Message {
         let mut question = Message::query();
         question.add_query(query);
-        question
-            .extensions_mut()
-            .get_or_insert_with(Edns::new)
-            .enable_dnssec();
+        question.edns.get_or_insert_with(Edns::new).enable_dnssec();
 
         let question_bytes = question.to_bytes().unwrap();
         let question_req =
@@ -1103,7 +1116,7 @@ mod dnssec {
     async fn test_dnskey_and_nsec3() {
         let catalog = make_catalog();
 
-        let mut query = Query::new();
+        let mut query = Query::root();
         query.set_name(Name::from_str("test.com.").unwrap());
         query.set_query_type(RecordType::DNSKEY);
 
@@ -1112,23 +1125,23 @@ mod dnssec {
             let result = run_query(&catalog, query).await;
 
             let dnskey = result
-                .answers()
+                .answers
                 .iter()
                 .find(|e| e.record_type() == RecordType::DNSKEY)
                 .expect("result to contain one DNSKEY");
             let rrsig = result
-                .answers()
+                .answers
                 .iter()
                 .find(|e| e.record_type() == RecordType::RRSIG)
                 .expect("result to contain one DNSKEY");
-            assert_eq!(result.answers().len(), 2, "expect only one answer");
+            assert_eq!(result.answers.len(), 2, "expect only one answer");
 
-            match dnskey.data() {
+            match &dnskey.data {
                 RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)) => assert!(dnskey.zone_key()),
                 _ => panic!("expected DNSKEY RData: {dnskey}"),
             }
 
-            match rrsig.data() {
+            match &rrsig.data {
                 RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => {
                     assert_eq!(rrsig.input().type_covered, RecordType::DNSKEY)
                 }
@@ -1138,26 +1151,26 @@ mod dnssec {
 
         // Check NSEC3
         {
-            let mut query = Query::new();
+            let mut query = Query::root();
             query.set_name(Name::from_str("test.com.").unwrap());
             query.set_query_type(RecordType::NSEC);
 
             let result = run_query(&catalog, query).await;
-            assert!(result.answers().is_empty());
+            assert!(result.answers.is_empty());
 
             result
-                .authorities()
+                .authorities
                 .iter()
                 .find(|e| e.record_type() == RecordType::SOA)
                 .expect("authority section to contains SOA");
 
             let nsec3 = result
-                .authorities()
+                .authorities
                 .iter()
                 .find(|e| e.record_type() == RecordType::NSEC3)
                 .expect("result to contain NSEC3");
 
-            let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = nsec3.data() else {
+            let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &nsec3.data else {
                 panic!("expected NSEC3 RData: {nsec3}");
             };
 
@@ -1184,19 +1197,19 @@ mod dnssec {
 
         // Check NSEC3PARAM
         {
-            let mut query = Query::new();
+            let mut query = Query::root();
             query.set_name(Name::from_str("test.com.").unwrap());
             query.set_query_type(RecordType::NSEC3PARAM);
 
             let result = run_query(&catalog, query).await;
 
             let nsec3param = result
-                .answers()
+                .answers
                 .iter()
                 .find(|e| e.record_type() == RecordType::NSEC3PARAM)
                 .expect("result to contain one NSEC3PARAM");
 
-            let RData::DNSSEC(DNSSECRData::NSEC3PARAM(nsec3param)) = nsec3param.data() else {
+            let RData::DNSSEC(DNSSECRData::NSEC3PARAM(nsec3param)) = &nsec3param.data else {
                 panic!("expected NSEC3PARAM RData: {nsec3param}");
             };
 

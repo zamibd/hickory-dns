@@ -18,9 +18,14 @@ use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
-#[cfg(feature = "metrics")]
+#[cfg(any(feature = "metrics", all(unix, feature = "systemd")))]
 use tokio::time::sleep;
-#[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
+#[cfg(any(
+    feature = "__tls",
+    feature = "__https",
+    feature = "__quic",
+    all(unix, feature = "systemd"),
+))]
 use tracing::warn;
 use tracing::{error, info};
 
@@ -31,7 +36,7 @@ use hickory_server::server::default_tls_server_config;
 use hickory_server::{server::Server, zone_handler::Catalog};
 
 mod config;
-use config::Config;
+use config::{Config, TcpSocketConfig, UdpSocketConfig};
 
 #[cfg(feature = "__dnssec")]
 pub mod dnssec;
@@ -215,12 +220,14 @@ impl DnsServer {
                     .prometheus_listen_addr
                     .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9000))
             });
-            let listener =
-                build_tcp_listener(socket_addr.ip(), socket_addr.port()).map_err(|err| {
-                    format!(
-                        "failed to bind to Prometheus TCP socket address {socket_addr:?}: {err}"
-                    )
-                })?;
+            let listener = build_tcp_listener(
+                socket_addr.ip(),
+                socket_addr.port(),
+                TcpSocketConfig::default(),
+            )
+            .map_err(|err| {
+                format!("failed to bind to Prometheus TCP socket address {socket_addr:?}: {err}")
+            })?;
             let local_addr = listener
                 .local_addr()
                 .map_err(|err| format!("failed to look up local address: {err}"))?;
@@ -288,6 +295,8 @@ impl DnsServer {
             http_endpoint,
             deny_networks,
             allow_networks,
+            udp_socket: udp_socket_config,
+            tcp_socket: tcp_socket_config,
         } = config;
 
         #[cfg(unix)]
@@ -359,6 +368,8 @@ impl DnsServer {
                 .transpose()?,
             #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
             ssl_keylog_enabled,
+            udp_socket_config,
+            tcp_socket_config,
         };
 
         let listen_port = port.unwrap_or(listen_port);
@@ -429,9 +440,34 @@ impl DnsServer {
         // Ideally the processing would be n-threads for receiving, which hand off to m-threads for
         //  request handling. It would generally be the case that n <= m.
         info!("server starting up, awaiting connections...");
+
+        #[cfg(all(unix, feature = "systemd"))]
+        sd_notify::notify(&[sd_notify::NotifyState::Ready])
+            .map_err(|e| format!("sd_notify READY=1 failed: {e}"))?;
+
+        #[cfg(all(unix, feature = "systemd"))]
+        if let Some(timeout) = sd_notify::watchdog_enabled() {
+            let interval = timeout / 2;
+            let token = server.shutdown_token().clone();
+            tokio::spawn(async move {
+                loop {
+                    sleep(interval).await;
+                    if token.is_cancelled() {
+                        break;
+                    }
+                    if let Err(error) = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]) {
+                        warn!(%error, "systemd watchdog ping failed");
+                    }
+                }
+            });
+            info!(?interval, "systemd watchdog enabled");
+        }
+
         match server.block_until_done().await {
             Ok(()) => {
                 // we're exiting for some reason...
+                #[cfg(all(unix, feature = "systemd"))]
+                sd_notify::notify(&[sd_notify::NotifyState::Stopping]).ok();
                 info!("Hickory DNS {} stopping", env!("CARGO_PKG_VERSION"));
             }
             Err(e) => {
@@ -467,24 +503,38 @@ struct ServerSetup<'a> {
     cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
     #[cfg(any(feature = "__tls", feature = "__https", feature = "__quic"))]
     ssl_keylog_enabled: bool,
+    udp_socket_config: UdpSocketConfig,
+    tcp_socket_config: TcpSocketConfig,
 }
 
 impl ServerSetup<'_> {
     fn udp(&mut self, port: u16) -> Result<(), String> {
+        #[cfg(unix)]
+        let num_sockets = self.udp_socket_config.sockets.unwrap_or(1);
+        #[cfg(not(unix))]
+        let num_sockets = 1_usize;
         for addr in &self.listen_addrs {
-            info!("binding UDP to {addr:?}");
+            info!("binding {num_sockets} UDP socket(s) to {addr:?}:{port}");
 
-            let udp_socket = build_udp_socket(*addr, port)
+            // Bind the first socket up-front so we can log the local address. This is helpful
+            // when binding :0 and allowing the OS to choose the listen port.
+            let first_socket = build_udp_socket(*addr, port, self.udp_socket_config)
                 .map_err(|err| format!("failed to bind to UDP socket address {addr:?}: {err}"))?;
+            let bound_addr = first_socket
+                .local_addr()
+                .map_err(|err| format!("failed to lookup local address: {err}"))?;
+            self.server.register_socket(first_socket);
 
-            info!(
-                "listening for UDP on {:?}",
-                udp_socket
-                    .local_addr()
-                    .map_err(|err| format!("failed to lookup local address: {err}"))?
-            );
+            // Afterward, bind any additional sockets.
+            for _ in 1..num_sockets {
+                self.server.register_socket(
+                    build_udp_socket(*addr, port, self.udp_socket_config).map_err(|err| {
+                        format!("failed to bind to UDP socket address {addr:?}: {err}")
+                    })?,
+                );
+            }
 
-            self.server.register_socket(udp_socket);
+            info!("listening for UDP on {bound_addr:?}");
         }
 
         Ok(())
@@ -494,7 +544,7 @@ impl ServerSetup<'_> {
         for addr in &self.listen_addrs {
             info!("binding TCP to {addr:?}");
 
-            let tcp_listener = build_tcp_listener(*addr, port)
+            let tcp_listener = build_tcp_listener(*addr, port, self.tcp_socket_config)
                 .map_err(|err| format!("failed to bind to TCP socket address {addr:?}: {err}"))?;
 
             info!(
@@ -504,8 +554,11 @@ impl ServerSetup<'_> {
                     .map_err(|err| format!("failed to lookup local address: {err}"))?
             );
 
-            self.server
-                .register_listener(tcp_listener, self.tcp_request_timeout);
+            self.server.register_listener(
+                tcp_listener,
+                self.tcp_request_timeout,
+                self.tcp_socket_config.response_buffer_size,
+            );
         }
 
         Ok(())
@@ -520,7 +573,7 @@ impl ServerSetup<'_> {
         for addr in &self.listen_addrs {
             info!("binding TLS to {addr:?}");
 
-            let tls_listener = build_tcp_listener(*addr, port)
+            let tls_listener = build_tcp_listener(*addr, port, self.tcp_socket_config)
                 .map_err(|err| format!("failed to bind to TLS socket address {addr:?}: {err}"))?;
 
             info!(
@@ -562,7 +615,7 @@ impl ServerSetup<'_> {
         for addr in &self.listen_addrs {
             info!("binding HTTPS to {addr:?}");
 
-            let https_listener = build_tcp_listener(*addr, port)
+            let https_listener = build_tcp_listener(*addr, port, self.tcp_socket_config)
                 .map_err(|err| format!("failed to bind to HTTPS socket address {addr:?}: {err}"))?;
 
             info!(
@@ -602,7 +655,7 @@ impl ServerSetup<'_> {
         for addr in &self.listen_addrs {
             info!("Binding QUIC to {addr:?}");
 
-            let quic_listener = build_udp_socket(*addr, port)
+            let quic_listener = build_udp_socket(*addr, port, self.udp_socket_config)
                 .map_err(|err| format!("failed to bind to QUIC socket address {addr:?}: {err}"))?;
 
             info!(
@@ -646,7 +699,11 @@ fn banner() {
 }
 
 /// Build a TcpListener for a given IP, port pair; IPv6 listeners will not accept v4 connections
-fn build_tcp_listener(ip: IpAddr, port: u16) -> Result<TcpListener, Error> {
+fn build_tcp_listener(
+    ip: IpAddr,
+    port: u16,
+    socket_config: TcpSocketConfig,
+) -> Result<TcpListener, Error> {
     let sock = if ip.is_ipv4() {
         Socket::new(Domain::IPV4, Type::STREAM, None)?
     } else {
@@ -655,19 +712,23 @@ fn build_tcp_listener(ip: IpAddr, port: u16) -> Result<TcpListener, Error> {
         s
     };
 
+    sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;
 
     let s_addr = SocketAddr::new(ip, port);
     sock.bind(&s_addr.into())?;
 
-    // this is a fairly typical backlog value, but we don't have any good data to support it as of yet
-    sock.listen(128)?;
+    sock.listen(socket_config.listen_backlog)?;
 
     TcpListener::from_std(sock.into())
 }
 
 /// Build a UdpSocket for a given IP, port pair; IPv6 sockets will not accept v4 connections
-fn build_udp_socket(ip: IpAddr, port: u16) -> Result<UdpSocket, Error> {
+fn build_udp_socket(
+    ip: IpAddr,
+    port: u16,
+    socket_config: UdpSocketConfig,
+) -> Result<UdpSocket, Error> {
     let sock = if ip.is_ipv4() {
         Socket::new(Domain::IPV4, Type::DGRAM, None)?
     } else {
@@ -677,6 +738,27 @@ fn build_udp_socket(ip: IpAddr, port: u16) -> Result<UdpSocket, Error> {
     };
 
     sock.set_nonblocking(true)?;
+
+    #[cfg(unix)]
+    if socket_config.sockets.is_some_and(|count| count > 1) {
+        sock.set_reuse_port(true)?;
+    }
+
+    if let Some(size) = socket_config.recv_buffer_size {
+        sock.set_recv_buffer_size(size)?;
+    }
+    if let Some(size) = socket_config.send_buffer_size {
+        sock.set_send_buffer_size(size)?;
+    }
+    if socket_config.recv_buffer_size.is_some() || socket_config.send_buffer_size.is_some() {
+        info!(
+            "UDP socket buffer sizes: recv={} send={} (requested recv={:?} send={:?})",
+            sock.recv_buffer_size().unwrap_or(0),
+            sock.send_buffer_size().unwrap_or(0),
+            socket_config.recv_buffer_size,
+            socket_config.send_buffer_size,
+        );
+    }
 
     let s_addr = SocketAddr::new(ip, port);
     sock.bind(&s_addr.into())?;

@@ -225,7 +225,6 @@ impl ZoneHandler for FileZoneHandler {
         self.in_memory.nx_proof_kind()
     }
 
-    #[cfg(feature = "metrics")]
     fn metrics_label(&self) -> &'static str {
         "file"
     }
@@ -308,9 +307,9 @@ mod tests {
             .into_iter()
             .next()
             .expect("A record not found in zone handler")
-            .data()
+            .data
         {
-            RData::A(ip) => assert_eq!(A::new(127, 0, 0, 1), *ip),
+            RData::A(ip) => assert_eq!(A::new(127, 0, 0, 1), ip),
             _ => panic!("wrong rdata type returned"),
         }
 
@@ -327,9 +326,9 @@ mod tests {
             .into_iter()
             .next()
             .expect("A record not found in zone handler")
-            .data()
+            .data
         {
-            RData::A(ip) => assert_eq!(A::new(127, 0, 0, 5), *ip),
+            RData::A(ip) => assert_eq!(A::new(127, 0, 0, 5), ip),
             _ => panic!("wrong rdata type returned"),
         }
     }

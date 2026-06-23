@@ -150,8 +150,8 @@ async fn test_nodata_where_name_exists() {
         )
         .await
         .unwrap();
-    assert_eq!(msg.response_code(), ResponseCode::NoError);
-    assert!(msg.answers().is_empty());
+    assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
+    assert!(msg.answers.is_empty());
 }
 
 #[tokio::test]
@@ -175,8 +175,8 @@ async fn test_nxdomain_where_no_name_exists() {
         )
         .await
         .unwrap();
-    assert_eq!(msg.response_code(), ResponseCode::NXDomain);
-    assert!(msg.answers().is_empty());
+    assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+    assert!(msg.answers.is_empty());
 }
 
 #[tokio::test]
@@ -270,9 +270,9 @@ async fn test_forward() {
 
     assert!(
         response
-            .answers()
+            .answers
             .iter()
-            .any(|record| matches!(record.data(), RData::A(_)))
+            .any(|record| matches!(record.data, RData::A(_)))
     );
 
     // just tests that multiple queries work
@@ -292,11 +292,11 @@ async fn test_forward() {
     .unwrap();
     assert!(
         response
-            .answers()
+            .answers
             .iter()
-            .any(|record| matches!(record.data(), RData::A(_)))
+            .any(|record| matches!(record.data, RData::A(_)))
     );
-    assert!(!response.header().authoritative());
+    assert!(!response.metadata.authoritative);
 }
 
 #[tokio::test]
@@ -351,6 +351,25 @@ async fn test_deny_networks_toml_startup() {
 
     // ipv6 should be refused
     query_a_refused(&mut client).await;
+}
+
+/// Test that the server starts successfully when a zone uses the SQLite store with
+/// `journal_path = ":memory:"`.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_sqlite_memory_journal_startup() {
+    subscribe();
+    let provider = TokioRuntimeProvider::new();
+    let server = TestServer::start("example_sqlite_memory.toml");
+    let tcp_port = server.ports.get_v4(Protocol::Tcp);
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+    let (future, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+    let stream = future.await.expect("failed to create tcp stream");
+    let (mut client, bg) = Client::<TokioRuntimeProvider>::new(stream, sender);
+    tokio::spawn(bg);
+
+    query_a(&mut client).await;
 }
 
 #[tokio::test]

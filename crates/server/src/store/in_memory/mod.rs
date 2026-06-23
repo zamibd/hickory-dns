@@ -99,14 +99,12 @@ impl<P: RuntimeProvider + Send + Sync> InMemoryZoneHandler<P> {
         // SOA must be present
         let soa = records
             .get(&RrKey::new(origin.clone().into(), RecordType::SOA))
-            .and_then(
-                |rrset| match rrset.records_without_rrsigs().next()?.data() {
-                    RData::SOA(soa) => Some(soa),
-                    _ => None,
-                },
-            )
+            .and_then(|rrset| match &rrset.records_without_rrsigs().next()?.data {
+                RData::SOA(soa) => Some(soa),
+                _ => None,
+            })
             .ok_or_else(|| format!("SOA record must be present: {origin}"))?;
-        let serial = soa.serial();
+        let serial = soa.serial;
 
         let iter = records.into_values();
 
@@ -386,7 +384,7 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
                             }
                             _ => None,
                         })
-                        .map(|records| records.map(Record::data).cloned().collect::<Vec<_>>());
+                        .map(|records| records.map(|r| &r.data).cloned().collect::<Vec<_>>());
 
                     (rdatas, a_aaaa_ttl)
                 };
@@ -468,10 +466,7 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
         request: &Request,
         lookup_options: LookupOptions,
     ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
-        let request_info = match request.request_info() {
-            Ok(info) => info,
-            Err(e) => return (LookupControlFlow::Break(Err(e)), None),
-        };
+        let request_info = request.request_info();
         debug!("searching InMemoryZoneHandler for: {}", request_info.query);
 
         let lookup_name = request_info.query.name();
@@ -479,16 +474,6 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
 
         // perform the actual lookup
         match record_type {
-            RecordType::SOA => (
-                self.lookup(
-                    self.origin(),
-                    record_type,
-                    Some(&request_info),
-                    lookup_options,
-                )
-                .await,
-                None,
-            ),
             RecordType::AXFR => (
                 LookupControlFlow::Break(Err(LookupError::NetError(
                     "AXFR must be handled with ZoneHandler::zone_transfer()".into(),
@@ -518,11 +503,7 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
         Result<ZoneTransfer, LookupError>,
         Option<TSigResponseContext>,
     )> {
-        let request_info = match request.request_info() {
-            Ok(info) => info,
-            Err(e) => return Some((Err(e), None)),
-        };
-
+        let request_info = request.request_info();
         if request_info.query.query_type() == RecordType::AXFR {
             // TODO: support more advanced AXFR options
             if !matches!(self.axfr_policy, AxfrPolicy::AllowAll) {
@@ -653,7 +634,6 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
         self.nx_proof_kind.as_ref()
     }
 
-    #[cfg(feature = "metrics")]
     fn metrics_label(&self) -> &'static str {
         "in-memory"
     }
@@ -707,12 +687,12 @@ fn maybe_next_name(
         _ => return None,
     };
 
-    let name = match (record_set.records_without_rrsigs().next()?.data(), t) {
+    let name = match (&record_set.records_without_rrsigs().next()?.data, t) {
         (RData::ANAME(name), RecordType::ANAME) => name,
         (RData::NS(ns), RecordType::NS) => &ns.0,
         (RData::CNAME(name), RecordType::CNAME) => name,
-        (RData::MX(mx), RecordType::MX) => mx.exchange(),
-        (RData::SRV(srv), RecordType::SRV) => srv.target(),
+        (RData::MX(mx), RecordType::MX) => &mx.exchange,
+        (RData::SRV(srv), RecordType::SRV) => &srv.target,
         _ => return None,
     };
 

@@ -44,62 +44,59 @@ pub trait BinEncodable {
 /// A trait for types which are serializable to and from DNS binary formats
 pub trait BinDecodable<'r>: Sized {
     /// Read the type from the stream
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self>;
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError>;
 
     /// Returns the object in binary form
-    fn from_bytes(bytes: &'r [u8]) -> ProtoResult<Self> {
+    fn from_bytes(bytes: &'r [u8]) -> Result<Self, DecodeError> {
         let mut decoder = BinDecoder::new(bytes);
         Self::read(&mut decoder)
     }
 }
 
+impl BinEncodable for u8 {
+    fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
+        encoder.emit_slice(&[*self])
+    }
+}
+
 impl BinEncodable for u16 {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16(*self)
+        encoder.emit_slice(&self.to_be_bytes())
     }
 }
 
 impl BinDecodable<'_> for u16 {
-    fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
-        decoder
-            .read_u16()
-            .map(Restrict::unverified)
-            .map_err(Into::into)
+    fn read(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
+        decoder.read_u16().map(Restrict::unverified)
     }
 }
 
 impl BinEncodable for i32 {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_i32(*self)
+        encoder.emit_slice(&self.to_be_bytes())
     }
 }
 
 impl<'r> BinDecodable<'r> for i32 {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
-        decoder
-            .read_i32()
-            .map(Restrict::unverified)
-            .map_err(Into::into)
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
+        decoder.read_i32().map(Restrict::unverified)
     }
 }
 
 impl BinEncodable for u32 {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u32(*self)
+        encoder.emit_slice(&self.to_be_bytes())
     }
 }
 
 impl BinDecodable<'_> for u32 {
-    fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
-        decoder
-            .read_u32()
-            .map(Restrict::unverified)
-            .map_err(Into::into)
+    fn read(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
+        decoder.read_u32().map(Restrict::unverified)
     }
 }
 
 impl BinEncodable for Vec<u8> {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_vec(self)
+        encoder.emit_slice(self)
     }
 }

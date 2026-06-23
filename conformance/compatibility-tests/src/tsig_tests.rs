@@ -79,32 +79,28 @@ async fn test_create() {
         .create(record.clone(), origin.clone())
         .await
         .expect("create failed");
-    assert_eq!(result.response_code(), ResponseCode::NoError);
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
     let result = client
-        .query(
-            record.name().clone(),
-            record.dns_class(),
-            record.record_type(),
-        )
+        .query(record.name.clone(), record.dns_class, record.record_type())
         .await
         .expect("query failed");
-    assert_eq!(result.response_code(), ResponseCode::NoError);
-    assert_eq!(result.answers().len(), 1);
-    assert_eq!(result.answers()[0], record);
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.answers.len(), 1);
+    assert_eq!(result.answers[0], record);
 
     // Trying to create the record again should error.
     let result = client
         .create(record.clone(), origin.clone())
         .await
         .expect("create failed");
-    assert_eq!(result.response_code(), ResponseCode::YXRRSet);
+    assert_eq!(result.metadata.response_code, ResponseCode::YXRRSet);
 
     // Similarly, trying to create the record again should fail if already set and
     // the update is not the same value.
-    record.set_data(RData::A(A::new(101, 11, 101, 11)));
+    record.data = RData::A(A::new(101, 11, 101, 11));
 
     let result = client.create(record, origin).await.expect("create failed");
-    assert_eq!(result.response_code(), ResponseCode::YXRRSet);
+    assert_eq!(result.metadata.response_code, ResponseCode::YXRRSet);
 }
 
 #[tokio::test]
@@ -164,7 +160,7 @@ async fn test_tsig_zone_transfer() {
     // We should have received the expected number of records; the count of bogus
     // records, plus the additional metadata records (SOA, NS, etc).
     assert_eq!(
-        result.iter().map(|r| r.answers().len()).sum::<usize>(),
+        result.iter().map(|r| r.answers.len()).sum::<usize>(),
         bogus_record_count + 3
     );
 }

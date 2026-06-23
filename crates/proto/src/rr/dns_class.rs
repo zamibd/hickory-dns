@@ -50,7 +50,7 @@ impl FromStr for DNSClass {
     ///
     /// ```
     /// use std::str::FromStr;
-    /// use hickory_proto::rr::dns_class::DNSClass;
+    /// use hickory_proto::rr::DNSClass;
     ///
     /// let var: DNSClass = DNSClass::from_str("IN").unwrap();
     /// assert_eq!(DNSClass::IN, var);
@@ -79,12 +79,12 @@ impl DNSClass {
 
 impl BinEncodable for DNSClass {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16((*self).into())
+        u16::from(*self).emit(encoder)
     }
 }
 
 impl BinDecodable<'_> for DNSClass {
-    fn read(decoder: &mut BinDecoder<'_>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'_>) -> Result<Self, DecodeError> {
         let this = Self::from(
             decoder.read_u16()?.unverified(/*DNSClass is verified as safe in processing this*/),
         );
@@ -98,7 +98,7 @@ impl BinDecodable<'_> for DNSClass {
 /// Convert from `DNSClass` to `&str`
 ///
 /// ```
-/// use hickory_proto::rr::dns_class::DNSClass;
+/// use hickory_proto::rr::DNSClass;
 ///
 /// let var: &'static str = DNSClass::IN.into();
 /// assert_eq!("IN", var);
@@ -120,7 +120,7 @@ impl From<DNSClass> for &'static str {
 /// Convert from `u16` to `DNSClass`
 ///
 /// ```
-/// use hickory_proto::rr::dns_class::DNSClass;
+/// use hickory_proto::rr::DNSClass;
 ///
 /// let var: DNSClass = 1u16.into();
 /// assert_eq!(DNSClass::IN, var);
@@ -141,7 +141,7 @@ impl From<u16> for DNSClass {
 /// Convert from `DNSClass` to `u16`
 ///
 /// ```
-/// use hickory_proto::rr::dns_class::DNSClass;
+/// use hickory_proto::rr::DNSClass;
 ///
 /// let var: u16 = DNSClass::IN.into();
 /// assert_eq!(1, var);

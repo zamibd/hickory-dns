@@ -36,7 +36,7 @@ pub mod dns_handle;
 pub use dns_handle::{DnsHandle, DnsStreamHandle};
 
 pub mod dns_multiplexer;
-pub use dns_multiplexer::{DnsMultiplexer, DnsMultiplexerConnect};
+pub use dns_multiplexer::DnsMultiplexer;
 
 pub mod retry_dns_handle;
 pub use retry_dns_handle::RetryDnsHandle;
@@ -161,11 +161,11 @@ pub trait DnsClientStream:
 /// Receiver handle for peekable fused SerialMessage channel
 pub type StreamReceiver = Peekable<Fuse<mpsc::Receiver<SerialMessage>>>;
 
-const CHANNEL_BUFFER_SIZE: usize = 32;
-
-/// A buffering stream bound to a `SocketAddr`
+/// A buffered channel for outbound DNS messages on a connection.
 ///
-/// This stream handle ensures that all messages sent via this handle have the remote_addr set as the destination for the packet
+/// Used to queue messages for sending over a DNS connection. On the client/resolver side,
+/// this buffers outbound queries to nameservers. On the server side, this buffers outbound
+/// responses to clients.
 #[derive(Clone)]
 pub struct BufDnsStreamHandle {
     remote_addr: SocketAddr,
@@ -173,14 +173,26 @@ pub struct BufDnsStreamHandle {
 }
 
 impl BufDnsStreamHandle {
-    /// Constructs a new Buffered Stream Handle, used for sending data to the DNS peer.
+    /// Constructs a new buffered stream handle with the default buffer size (32).
     ///
     /// # Arguments
     ///
-    /// * `remote_addr` - the address of the remote DNS system (client or server)
-    /// * `sender` - the handle being used to send data to the server
+    /// * `remote_addr` - address of the DNS peer (nameserver for clients, client for servers)
     pub fn new(remote_addr: SocketAddr) -> (Self, StreamReceiver) {
-        let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        Self::with_buffer_size(remote_addr, DEFAULT_STREAM_BUFFER_SIZE)
+    }
+
+    /// Constructs a new buffered stream handle with an explicit buffer size.
+    ///
+    /// Use this when you need a larger buffer to handle high message rates without
+    /// dropping messages due to backpressure.
+    ///
+    /// # Arguments
+    ///
+    /// * `remote_addr` - address of the DNS peer (nameserver for clients, client for servers)
+    /// * `buffer_size` - maximum number of messages that can be queued for sending
+    pub fn with_buffer_size(remote_addr: SocketAddr, buffer_size: usize) -> (Self, StreamReceiver) {
+        let (sender, receiver) = mpsc::channel(buffer_size);
         let receiver = receiver.fuse().peekable();
 
         let this = Self {
@@ -248,8 +260,7 @@ impl<P: RuntimeProvider> DnsHandle for BufDnsRequestStreamHandle<P> {
     fn send(&self, request: DnsRequest) -> Self::Response {
         debug!(
             "enqueueing message:{}:{:?}",
-            request.op_code(),
-            request.queries()
+            request.op_code, request.queries
         );
 
         let (request, oneshot) = OneshotDnsRequest::oneshot(request);
@@ -453,5 +464,17 @@ impl Display for Protocol {
     }
 }
 
+/// Default per-connection timeout for TCP/TLS/QUIC connect attempts.
 #[allow(unused)] // May be unused depending on features
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default buffer size for outbound DNS message streams.
+///
+/// This controls the maximum number of DNS messages that can be queued for sending on a
+/// single connection. The buffer is used in two contexts:
+///
+/// - **Server side**: buffers outbound responses to clients
+/// - **Client/resolver side**: buffers outbound queries to nameservers
+///
+/// Under high load, a larger buffer prevents messages from being dropped due to backpressure.
+const DEFAULT_STREAM_BUFFER_SIZE: usize = 32;

@@ -207,13 +207,13 @@ impl Algorithm {
 
 impl BinEncodable for Algorithm {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit(u8::from(*self))
+        u8::from(*self).emit(encoder)
     }
 }
 
 impl<'r> BinDecodable<'r> for Algorithm {
     // https://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         let algorithm_id =
             decoder.read_u8()?.unverified(/*Algorithm is verified as safe in processing this*/);
         Ok(Self::from_u8(algorithm_id))

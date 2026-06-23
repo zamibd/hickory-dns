@@ -15,6 +15,7 @@ use core::str::FromStr;
 use core::task::{Context, Poll};
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::{Stream, StreamExt};
@@ -54,6 +55,7 @@ impl HttpsClientStream {
             client_config,
             bind_addr: None,
             set_headers: None,
+            connect_timeout: CONNECT_TIMEOUT,
         }
     }
 }
@@ -116,7 +118,7 @@ impl DnsRequestSender for HttpsClientStream {
         }
 
         // per the RFC, a zero id allows for the HTTP packet to be cached better
-        request.set_id(0);
+        request.metadata.id = 0;
 
         let bytes = match request.to_vec() {
             Ok(bytes) => bytes,
@@ -166,6 +168,7 @@ pub struct HttpsClientStreamBuilder<P> {
     client_config: Arc<ClientConfig>,
     bind_addr: Option<SocketAddr>,
     set_headers: Option<Arc<dyn SetHeaders>>,
+    connect_timeout: Duration,
 }
 
 impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
@@ -177,6 +180,14 @@ impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
     /// Set the [`SetHeaders`] trait object used to inject dynamic headers into the DoH request
     pub fn set_headers(&mut self, headers: Arc<dyn SetHeaders>) {
         self.set_headers.replace(headers);
+    }
+
+    /// Override the connect timeout (default: 2 seconds).
+    ///
+    /// This controls both the TCP connect and the HTTP/2 handshake timeouts.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
     }
 
     /// Creates a new [`DnsExchange`] wrapping the [`HttpsClientStream`] from this builder
@@ -213,6 +224,7 @@ impl<P: RuntimeProvider> HttpsClientStreamBuilder<P> {
             server_name,
             path,
             self.set_headers,
+            self.connect_timeout,
         )
     }
 }
@@ -225,6 +237,7 @@ pub fn connect(
     server_name: Arc<str>,
     query_path: Arc<str>,
     set_headers: Option<Arc<dyn SetHeaders>>,
+    connect_timeout: Duration,
 ) -> impl Future<Output = Result<HttpsClientStream, NetError>> + Send + 'static {
     // ensure the ALPN protocol is set correctly
     if client_config.alpn_protocols.is_empty() {
@@ -252,21 +265,19 @@ pub fn connect(
             }
         };
 
-        let tcp = tcp.await?;
-        let future = timeout(
-            CONNECT_TIMEOUT,
-            TlsConnector::from(client_config).connect(tls_server_name, AsyncIoStdAsTokio(tcp)),
-        );
+        let (h2, driver) = timeout(connect_timeout, async {
+            let tcp = tcp.await?;
+            let tls = TlsConnector::from(client_config)
+                .connect(tls_server_name, AsyncIoStdAsTokio(tcp))
+                .await
+                .map_err(NetError::from)?;
 
-        let tls = match future.await {
-            Ok(Ok(tls)) => tls,
-            Ok(Err(err)) => return Err(NetError::from(err)),
-            Err(_) => return Err(NetError::Timeout),
-        };
-
-        let mut handshake = h2::client::Builder::new();
-        handshake.enable_push(false);
-        let (h2, driver) = handshake.handshake(tls).await?;
+            let mut handshake = h2::client::Builder::new();
+            handshake.enable_push(false);
+            handshake.handshake(tls).await.map_err(NetError::from)
+        })
+        .await
+        .map_err(|_| NetError::Timeout)??;
 
         debug!("h2 connection established to: {name_server}");
         tokio::spawn(async {
@@ -288,13 +299,7 @@ async fn send(
     message: Bytes,
     cx: Arc<RequestContext>,
 ) -> Result<DnsResponse, NetError> {
-    let mut h2 = match h2.ready().await {
-        Ok(h2) => h2,
-        Err(err) => {
-            // TODO: make specific error
-            return Err(NetError::from(format!("h2 send_request error: {err}")));
-        }
-    };
+    let mut h2 = h2.ready().await?;
 
     // build up the http request
     let request = cx
@@ -304,17 +309,11 @@ async fn send(
     debug!("request: {:#?}", request);
 
     // Send the request
-    let (response_future, mut send_stream) = h2
-        .send_request(request, false)
-        .map_err(|err| NetError::from(format!("h2 send_request error: {err}")))?;
+    let (response_future, mut send_stream) = h2.send_request(request, false)?;
 
-    send_stream
-        .send_data(message, true)
-        .map_err(|e| NetError::from(format!("h2 send_data error: {e}")))?;
+    send_stream.send_data(message, true)?;
 
-    let mut response_stream = response_future
-        .await
-        .map_err(|err| NetError::from(format!("received a stream error: {err}")))?;
+    let mut response_stream = response_future.await?;
 
     debug!("got response: {:#?}", response_stream);
 
@@ -501,13 +500,13 @@ mod tests {
 
         let google = SocketAddr::from(([8, 8, 8, 8], 443));
         let mut request = Message::query();
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -528,24 +527,24 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::A(_)))
+                .any(|record| matches!(record.data, RData::A(_)))
         );
 
         //
         // assert that the connection works for a second query
         let mut request = Message::query();
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -557,9 +556,9 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::AAAA(_)))
+                .any(|record| matches!(record.data, RData::AAAA(_)))
         );
     }
 
@@ -570,13 +569,13 @@ mod tests {
 
         let google = SocketAddr::from(([8, 8, 8, 8], 443));
         let mut request = Message::query();
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -601,24 +600,24 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::A(_)))
+                .any(|record| matches!(record.data, RData::A(_)))
         );
 
         //
         // assert that the connection works for a second query
         let mut request = Message::query();
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -630,9 +629,9 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::AAAA(_)))
+                .any(|record| matches!(record.data, RData::AAAA(_)))
         );
     }
 
@@ -644,13 +643,13 @@ mod tests {
 
         let cloudflare = SocketAddr::from(([1, 1, 1, 1], 443));
         let mut request = Message::query();
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -673,24 +672,24 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::A(_)))
+                .any(|record| matches!(record.data, RData::A(_)))
         );
 
         //
         // assert that the connection works for a second query
         let mut request = Message::query();
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );
         request.add_query(query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         let mut edns = Edns::new();
         edns.set_version(0);
         edns.set_max_payload(1232);
-        *request.extensions_mut() = Some(edns);
+        request.edns = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
@@ -702,9 +701,9 @@ mod tests {
 
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
-                .any(|record| matches!(record.data(), RData::AAAA(_)))
+                .any(|record| matches!(record.data, RData::AAAA(_)))
         );
     }
 

@@ -203,7 +203,7 @@ async fn test_rrsig_ttl() {
         tokio::spawn(bg);
 
         // query www.example.com. expected ttl is 86400.
-        let query = Query::query("www.example.com.".parse().unwrap(), RecordType::A);
+        let query = Query::new("www.example.com.".parse().unwrap(), RecordType::A);
         let response = client
             .lookup(query, options)
             .try_next()
@@ -214,19 +214,19 @@ async fn test_rrsig_ttl() {
         // check the ttl of all answers, of which at least one must be of type A and one
         // of type RRSIG
         let expected_ttl = 86400;
-        for answer in response.answers() {
+        for answer in &response.answers {
             println!("{answer}");
-            assert_eq!(answer.ttl(), expected_ttl);
+            assert_eq!(answer.ttl, expected_ttl);
         }
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
                 .any(|answer| answer.record_type() == RecordType::A)
         );
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
                 .any(|answer| answer.record_type() == RecordType::RRSIG)
         );
@@ -238,7 +238,7 @@ async fn test_rrsig_ttl() {
         tokio::spawn(bg);
 
         // query shortlived.example.com. expected ttl is 900.
-        let query = Query::query("shortlived.example.com.".parse().unwrap(), RecordType::A);
+        let query = Query::new("shortlived.example.com.".parse().unwrap(), RecordType::A);
         let response = client
             .lookup(query, options)
             .try_next()
@@ -249,19 +249,19 @@ async fn test_rrsig_ttl() {
         // check the ttl of all answers, of which at least one must be of type A and one
         // of type RRSIG
         let expected_ttl = 900;
-        for answer in response.answers() {
+        for answer in &response.answers {
             println!("{answer}");
-            assert_eq!(answer.ttl(), expected_ttl);
+            assert_eq!(answer.ttl, expected_ttl);
         }
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
                 .any(|answer| answer.record_type() == RecordType::A)
         );
         assert!(
             response
-                .answers()
+                .answers
                 .iter()
                 .any(|answer| answer.record_type() == RecordType::RRSIG)
         );

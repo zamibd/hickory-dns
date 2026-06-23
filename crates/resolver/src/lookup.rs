@@ -33,7 +33,7 @@ impl Lookup {
     /// Create a new Lookup from a complete DNS Message.
     pub(crate) fn new(message: Message, valid_until: Instant) -> Self {
         debug_assert!(
-            !message.queries().is_empty(),
+            !message.queries.is_empty(),
             "lookup message must have at least one query"
         );
 
@@ -45,7 +45,7 @@ impl Lookup {
 
     /// Return new instance with given rdata and the maximum TTL.
     pub fn from_rdata(query: Query, rdata: RData) -> Self {
-        let record = Record::from_rdata(query.name().clone(), MAX_TTL, rdata);
+        let record = Record::from_rdata(query.name.clone(), MAX_TTL, rdata);
         Self::new_with_max_ttl(query, [record])
     }
 
@@ -74,7 +74,7 @@ impl Lookup {
     /// Returns a reference to the `Query` that was used to produce this result.
     pub fn query(&self) -> &Query {
         self.message
-            .queries()
+            .queries
             .first()
             .expect("Lookup message always has a query")
     }
@@ -86,17 +86,17 @@ impl Lookup {
 
     /// Returns a reference to the answer records from the message.
     pub fn answers(&self) -> &[Record] {
-        self.message.answers()
+        &self.message.answers
     }
 
     /// Returns a reference to the authority records from the message.
     pub fn authorities(&self) -> &[Record] {
-        self.message.authorities()
+        &self.message.authorities
     }
 
     /// Returns a reference to the additional records from the message.
     pub fn additionals(&self) -> &[Record] {
-        self.message.additionals()
+        &self.message.additionals
     }
 
     /// Returns the `Instant` at which this `Lookup` is no longer valid.
@@ -145,6 +145,12 @@ impl Lookup {
     }
 }
 
+impl From<Lookup> for Message {
+    fn from(lookup: Lookup) -> Self {
+        lookup.message
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -165,17 +171,17 @@ mod tests {
             80,
             RData::A(A::new(127, 0, 0, 1)),
         );
-        a1.set_proof(Proof::Secure);
+        a1.proof = Proof::Secure;
 
         let mut a2 = Record::from_rdata(
             Name::from_str("www.example.com.").unwrap(),
             80,
             RData::A(A::new(127, 0, 0, 2)),
         );
-        a2.set_proof(Proof::Insecure);
+        a2.proof = Proof::Insecure;
 
         let mut message = Message::response(0, OpCode::Query);
-        message.add_query(Query::default());
+        message.add_query(Query::root());
         message.add_answers([a1.clone(), a2.clone()]);
 
         let lookup = Lookup {
@@ -197,7 +203,7 @@ mod tests {
     fn test_extend_answers_preserves_sections() {
         // Create a message with records in different sections
         let mut message = Message::response(0, OpCode::Query);
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         message.add_query(query.clone());
 
         message.add_answers(vec![Record::from_rdata(
@@ -238,14 +244,14 @@ mod tests {
         assert_eq!(lookup.additionals().len(), 1);
 
         // Verify the authority and additional records are intact
-        if let RData::NS(ns) = lookup.authorities()[0].data() {
+        if let RData::NS(ns) = &lookup.authorities()[0].data {
             assert_eq!(ns.0, Name::from_str("ns1.example.com.").unwrap());
         } else {
             panic!("Authority record should be NS");
         }
 
-        if let RData::A(a) = lookup.additionals()[0].data() {
-            assert_eq!(*a, A::new(192, 0, 2, 1));
+        if let RData::A(a) = lookup.additionals()[0].data {
+            assert_eq!(a, A::new(192, 0, 2, 1));
         } else {
             panic!("Additional record should be A");
         }
@@ -255,7 +261,7 @@ mod tests {
     fn test_append_preserves_sections() {
         // Create first lookup with records in all sections
         let mut message1 = Message::response(0, OpCode::Query);
-        let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         message1.add_query(query.clone());
         message1.add_answers(vec![Record::from_rdata(
             Name::from_str("www.example.com.").unwrap(),
@@ -311,37 +317,37 @@ mod tests {
         assert_eq!(combined.additionals().len(), 2);
 
         // Verify answer records
-        if let RData::A(a) = combined.answers()[0].data() {
-            assert_eq!(*a, A::new(127, 0, 0, 1));
+        if let RData::A(a) = combined.answers()[0].data {
+            assert_eq!(a, A::new(127, 0, 0, 1));
         } else {
             panic!("First answer should be A");
         }
-        if let RData::A(a) = combined.answers()[1].data() {
-            assert_eq!(*a, A::new(127, 0, 0, 2));
+        if let RData::A(a) = combined.answers()[1].data {
+            assert_eq!(a, A::new(127, 0, 0, 2));
         } else {
             panic!("Second answer should be A");
         }
 
         // Verify authority records
-        if let RData::NS(ns) = combined.authorities()[0].data() {
+        if let RData::NS(ns) = &combined.authorities()[0].data {
             assert_eq!(ns.0, Name::from_str("ns1.example.com.").unwrap());
         } else {
             panic!("First authority should be NS");
         }
-        if let RData::NS(ns) = combined.authorities()[1].data() {
+        if let RData::NS(ns) = &combined.authorities()[1].data {
             assert_eq!(ns.0, Name::from_str("ns2.example.com.").unwrap());
         } else {
             panic!("Second authority should be NS");
         }
 
         // Verify additional records
-        if let RData::A(a) = combined.additionals()[0].data() {
-            assert_eq!(*a, A::new(192, 0, 2, 1));
+        if let RData::A(a) = combined.additionals()[0].data {
+            assert_eq!(a, A::new(192, 0, 2, 1));
         } else {
             panic!("First additional should be A");
         }
-        if let RData::A(a) = combined.additionals()[1].data() {
-            assert_eq!(*a, A::new(192, 0, 2, 2));
+        if let RData::A(a) = combined.additionals()[1].data {
+            assert_eq!(a, A::new(192, 0, 2, 2));
         } else {
             panic!("Second additional should be A");
         }

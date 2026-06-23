@@ -11,7 +11,10 @@ use hickory_net::{
 };
 use hickory_proto::{
     op::{DnsRequestOptions, DnsResponse, Query},
-    rr::{DNSClass, Name, RData, Record, RecordType, rdata::A},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::{A, AAAA},
+    },
 };
 use hickory_resolver::{
     Hosts, LookupFuture, caching_client::CachingClient, config::LookupIpStrategy, lookup::Lookup,
@@ -46,10 +49,7 @@ async fn test_lookup() {
     );
     let lookup = lookup.await.unwrap();
 
-    assert_eq!(
-        lookup.answers()[0].data(),
-        &RData::A(A::new(93, 184, 215, 14))
-    );
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
 }
 
 #[tokio::test]
@@ -69,13 +69,16 @@ async fn test_lookup_hosts() {
     let record = Record::from_rdata(
         Name::from_str("www.example.com.").unwrap(),
         86400,
-        RData::A(A::new(10, 0, 1, 104)),
+        RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)),
     );
     hosts.insert(
         Name::from_str("www.example.com.").unwrap(),
-        RecordType::A,
+        RecordType::AAAA,
         Lookup::new_with_max_ttl(
-            Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A),
+            Query::new(
+                Name::from_str("www.example.com.").unwrap(),
+                RecordType::AAAA,
+            ),
             [record],
         ),
     );
@@ -90,7 +93,10 @@ async fn test_lookup_hosts() {
     );
     let lookup = lookup.await.unwrap();
 
-    assert_eq!(lookup.iter().next().unwrap(), Ipv4Addr::new(10, 0, 1, 104));
+    assert_eq!(
+        lookup.iter().next().unwrap(),
+        Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)
+    );
 }
 
 fn create_ip_like_example() -> InMemoryZoneHandler {
@@ -100,9 +106,7 @@ fn create_ip_like_example() -> InMemoryZoneHandler {
             Name::from_str("1.2.3.4.example.com.").unwrap(),
             86400,
             RData::A(A::new(198, 51, 100, 35)),
-        )
-        .set_dns_class(DNSClass::IN)
-        .clone(),
+        ),
         0,
     );
 
@@ -170,7 +174,7 @@ async fn test_lookup_ipv4_like_fall_through() {
 #[tokio::test]
 async fn test_mock_lookup() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
     let v4_record = v4_record(
         Name::from_str("www.example.com.").unwrap(),
         Ipv4Addr::new(93, 184, 215, 14),
@@ -187,17 +191,13 @@ async fn test_mock_lookup() {
     );
 
     let lookup = lookup.await.unwrap();
-
-    assert_eq!(
-        lookup.answers()[0].data(),
-        &RData::A(A::new(93, 184, 215, 14))
-    );
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
 }
 
 #[tokio::test]
 async fn test_cname_lookup() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
     let cname_record = cname_record(
         Name::from_str("www.example.com.").unwrap(),
         Name::from_str("v4.example.com.").unwrap(),
@@ -218,17 +218,13 @@ async fn test_cname_lookup() {
     );
 
     let lookup = lookup.await.unwrap();
-
-    assert_eq!(
-        lookup.answers()[0].data(),
-        &RData::A(A::new(93, 184, 215, 14))
-    );
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
 }
 
 #[tokio::test]
 async fn test_cname_lookup_preserve() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
     let cname_record = cname_record(
         Name::from_str("www.example.com.").unwrap(),
         Name::from_str("v4.example.com.").unwrap(),
@@ -255,15 +251,15 @@ async fn test_cname_lookup_preserve() {
 
     let lookup = lookup.await.unwrap();
 
-    let mut iter = lookup.answers().iter().map(|r| r.data());
-    assert_eq!(iter.next().unwrap(), cname_record.data());
-    assert_eq!(*iter.next().unwrap(), RData::A(A::new(93, 184, 215, 14)));
+    let mut iter = lookup.answers().iter().map(|r| &r.data);
+    assert_eq!(iter.next().unwrap(), &cname_record.data);
+    assert_eq!(iter.next().unwrap(), &RData::A(A::new(93, 184, 215, 14)));
 }
 
 #[tokio::test]
 async fn test_chained_cname_lookup() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
     let cname_record = cname_record(
         Name::from_str("www.example.com.").unwrap(),
         Name::from_str("v4.example.com.").unwrap(),
@@ -291,17 +287,13 @@ async fn test_chained_cname_lookup() {
     );
 
     let lookup = lookup.await.unwrap();
-
-    assert_eq!(
-        lookup.answers()[0].data(),
-        &RData::A(A::new(93, 184, 215, 14))
-    );
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
 }
 
 #[tokio::test]
 async fn test_chained_cname_lookup_preserve() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
     let cname_record = cname_record(
         Name::from_str("www.example.com.").unwrap(),
         Name::from_str("v4.example.com.").unwrap(),
@@ -335,15 +327,15 @@ async fn test_chained_cname_lookup_preserve() {
 
     let lookup = lookup.await.unwrap();
 
-    let mut iter = lookup.answers().iter().map(|r| r.data());
-    assert_eq!(iter.next().unwrap(), cname_record.data());
-    assert_eq!(*iter.next().unwrap(), RData::A(A::new(93, 184, 215, 14)));
+    let mut iter = lookup.answers().iter().map(|r| &r.data);
+    assert_eq!(iter.next().unwrap(), &cname_record.data);
+    assert_eq!(iter.next().unwrap(), &RData::A(A::new(93, 184, 215, 14)));
 }
 
 #[tokio::test]
 async fn test_max_chained_lookup_depth() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
     let cname_record1 = cname_record(
         Name::from_str("www.example.com.").unwrap(),
         Name::from_str("cname2.example.com.").unwrap(),
@@ -432,11 +424,7 @@ async fn test_max_chained_lookup_depth() {
 
     println!("performing followup resolve, should work");
     let lookup = lookup.await.unwrap();
-
-    assert_eq!(
-        lookup.answers()[0].data(),
-        &RData::A(A::new(93, 184, 215, 14))
-    );
+    assert_eq!(lookup.answers()[0].data, RData::A(A::new(93, 184, 215, 14)));
 }
 
 // This test expects a no-answer query which returns a SOA record in the nameservers section to
@@ -445,7 +433,7 @@ async fn test_max_chained_lookup_depth() {
 #[tokio::test]
 async fn test_forward_soa() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::NS);
+    let resp_query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::NS);
     let soa_record = soa_record(
         Name::from_str("www.example.com").unwrap(),
         Name::from_str("ns1.example.com").unwrap(),
@@ -482,7 +470,7 @@ async fn test_forward_soa() {
 #[tokio::test]
 async fn test_forward_ns() {
     subscribe();
-    let resp_query = Query::query(Name::from_str("example.com.").unwrap(), RecordType::A);
+    let resp_query = Query::new(Name::from_str("example.com.").unwrap(), RecordType::A);
     let ns1 = ns_record(Name::default(), Name::from_str("ns1.example.com").unwrap());
     let message = message(resp_query.clone(), vec![], vec![ns1], vec![]);
 

@@ -46,29 +46,25 @@ impl ResponseCache {
 
     /// Insert a response into the cache.
     pub fn insert(&self, query: Query, result: Result<Message, NetError>, now: Instant) {
-        let ttl = match &result {
-            Ok(message) => {
-                let (positive_min_ttl, positive_max_ttl) = self
-                    .ttl_config
-                    .positive_response_ttl_bounds(query.query_type())
-                    .into_inner();
-                message
-                    .all_sections()
-                    .map(|record| Duration::from_secs(record.ttl().into()))
-                    .min()
-                    .unwrap_or(positive_min_ttl)
-                    .clamp(positive_min_ttl, positive_max_ttl)
+        let (ttl, result) = match result {
+            Ok(mut message) => {
+                let ttl = self.clamp_positive_ttls(query.query_type, &mut message);
+                (ttl, Ok(message))
             }
             Err(NetError::Dns(DnsError::NoRecordsFound(no_records))) => {
                 let (negative_min_ttl, negative_max_ttl) = self
                     .ttl_config
-                    .negative_response_ttl_bounds(query.query_type())
+                    .negative_response_ttl_bounds(query.query_type)
                     .into_inner();
-                if let Some(ttl) = no_records.negative_ttl {
+                let ttl = if let Some(ttl) = no_records.negative_ttl {
                     Duration::from_secs(u64::from(ttl)).clamp(negative_min_ttl, negative_max_ttl)
                 } else {
                     negative_min_ttl
-                }
+                };
+                (
+                    ttl,
+                    Err(NetError::Dns(DnsError::NoRecordsFound(no_records))),
+                )
             }
             Err(_) => return,
         };
@@ -92,6 +88,49 @@ impl ResponseCache {
         Some(entry.updated_ttl(now))
     }
 
+    /// Clamp all record TTLs to `[positive_min_ttl, positive_max_ttl]` and return
+    /// the cache duration derived from the minimum TTL of records matching
+    /// `query_type` across all sections.
+    ///
+    /// Each record is clamped according to the TTL bounds configured for its own
+    /// record type, so that per-type overrides are respected even for authority
+    /// and additional section records.
+    pub(crate) fn clamp_positive_ttls(
+        &self,
+        query_type: RecordType,
+        message: &mut Message,
+    ) -> Duration {
+        for record in message
+            .answers
+            .iter_mut()
+            .chain(message.authorities.iter_mut())
+            .chain(message.additionals.iter_mut())
+        {
+            let (min_secs, max_secs) = self
+                .ttl_config
+                .positive_ttl_bounds_secs(record.record_type());
+            record.ttl = record.ttl.clamp(min_secs, max_secs);
+        }
+
+        let (positive_min_ttl, positive_max_ttl) = self
+            .ttl_config
+            .positive_response_ttl_bounds(query_type)
+            .into_inner();
+
+        // Derive cache duration from the minimum TTL of records whose type
+        // matches the query, across all sections.  This avoids letting
+        // unrelated authority/additional records skew the cache lifetime.
+        let min_ttl = message
+            .all_sections()
+            .filter(|r| r.record_type() == query_type)
+            .map(|r| Duration::from_secs(r.ttl.into()))
+            .min();
+
+        min_ttl
+            .unwrap_or(positive_min_ttl)
+            .clamp(positive_min_ttl, positive_max_ttl)
+    }
+
     pub(crate) fn clear(&self) {
         self.cache.invalidate_all();
     }
@@ -101,7 +140,7 @@ impl ResponseCache {
     }
 
     /// Returns the approximate number of entries in the cache.
-    #[cfg(all(feature = "metrics", feature = "recursor"))]
+    #[cfg(feature = "metrics")]
     pub(crate) fn entry_count(&self) -> u64 {
         #[cfg(test)]
         {
@@ -136,12 +175,12 @@ impl Entry {
         match &*self.result {
             Ok(response) => {
                 let mut response = response.clone();
-                for section_fn in [
-                    Message::answers_mut,
-                    Message::authorities_mut,
-                    Message::additionals_mut,
+                for records in [
+                    &mut response.answers,
+                    &mut response.authorities,
+                    &mut response.additionals,
                 ] {
-                    for record in section_fn(&mut response) {
+                    for record in records {
                         record.decrement_ttl(elapsed);
                     }
                 }
@@ -292,6 +331,18 @@ impl TtlConfig {
         self
     }
 
+    /// Returns the positive-response TTL bounds as `(min_secs, max_secs)` clamped to `u32`.
+    ///
+    /// This is a convenience wrapper around [`positive_response_ttl_bounds`](Self::positive_response_ttl_bounds)
+    /// for use when clamping individual record TTLs.
+    fn positive_ttl_bounds_secs(&self, record_type: RecordType) -> (u32, u32) {
+        let (min, max) = self.positive_response_ttl_bounds(record_type).into_inner();
+        (
+            u32::try_from(min.as_secs()).unwrap_or(MAX_TTL),
+            u32::try_from(max.as_secs()).unwrap_or(MAX_TTL),
+        )
+    }
+
     /// Retrieves the minimum and maximum TTL values for positive responses.
     pub fn positive_response_ttl_bounds(&self, query_type: RecordType) -> RangeInclusive<Duration> {
         let bounds = self.by_query_type.get(&query_type).unwrap_or(&self.default);
@@ -436,7 +487,7 @@ mod tests {
             op::{Message, OpCode, Query, ResponseCode},
             rr::{
                 Name, RData, Record, RecordType,
-                rdata::{A, NS, SOA, TXT},
+                rdata::{A, AAAA, NS, SOA, TXT},
             },
         },
     };
@@ -466,7 +517,7 @@ mod tests {
         let now = Instant::now();
 
         let name = Name::from_str("www.example.com.").unwrap();
-        let query = Query::query(name.clone(), RecordType::A);
+        let query = Query::new(name.clone(), RecordType::A);
         // Record should have TTL of 1 second.
         let mut message = Message::response(0, OpCode::Query);
         message.add_answer(Record::from_rdata(
@@ -504,11 +555,155 @@ mod tests {
     }
 
     #[test]
+    fn test_positive_min_ttl_clamps_record_ttls() {
+        // Regression test: records with TTLs below positive_min_ttl must have their
+        // TTLs raised in the cached message. Otherwise `updated_ttl()` subtracts
+        // elapsed time from the original (low) TTL, which saturates to 0 long before
+        // the cache entry expires.
+        let now = Instant::now();
+
+        let name = Name::from_str("www.example.com.").unwrap();
+        let query = Query::new(name.clone(), RecordType::A);
+
+        // Upstream record has TTL=60, but positive_min_ttl is 3600.
+        let mut message = Message::response(0, OpCode::Query);
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            60,
+            RData::A(A::new(93, 184, 216, 34)),
+        ));
+
+        let ttls = TtlConfig::from(TtlBounds {
+            positive_min_ttl: Some(Duration::from_secs(3600)),
+            ..TtlBounds::default()
+        });
+        let cache = ResponseCache::new(1, ttls);
+
+        cache.insert(query.clone(), Ok(message), now);
+
+        // The cache stores the record with the clamped TTL (3600). At t=0 that is
+        // what clients receive.
+        let result = cache.get(&query, now).unwrap().unwrap();
+        assert_eq!(result.answers.first().unwrap().ttl, 3600);
+
+        // At t=61 the returned TTL counts down from the cached 3600, not the
+        // upstream 60.
+        let result = cache
+            .get(&query, now + Duration::from_secs(61))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.answers.first().unwrap().ttl, 3539);
+
+        // At t=3599: still valid, TTL=1.
+        let result = cache
+            .get(&query, now + Duration::from_secs(3599))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.answers.first().unwrap().ttl, 1);
+
+        // At t=3601: cache miss — a new upstream lookup will be issued.
+        assert!(cache.get(&query, now + Duration::from_secs(3601)).is_none());
+    }
+
+    #[test]
+    fn test_positive_max_ttl_clamps_record_ttls() {
+        // Regression test: records with TTLs above positive_max_ttl must have their
+        // TTLs lowered in the cached message. Otherwise clients see the original high
+        // TTL while the cache entry expires at positive_max_ttl, causing the TTL to
+        // appear to "reset" after every max_ttl interval.
+        let now = Instant::now();
+
+        let name = Name::from_str("www.example.com.").unwrap();
+        let query = Query::new(name.clone(), RecordType::A);
+
+        // Upstream record has TTL=3600, but positive_max_ttl is 120.
+        let mut message = Message::response(0, OpCode::Query);
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            3600,
+            RData::A(A::new(93, 184, 216, 34)),
+        ));
+
+        let ttls = TtlConfig::from(TtlBounds {
+            positive_max_ttl: Some(Duration::from_secs(120)),
+            ..TtlBounds::default()
+        });
+        let cache = ResponseCache::new(1, ttls);
+
+        cache.insert(query.clone(), Ok(message), now);
+
+        // The cache stores the record with the clamped TTL (120), not the
+        // upstream 3600.
+        let result = cache.get(&query, now).unwrap().unwrap();
+        assert_eq!(result.answers.first().unwrap().ttl, 120);
+
+        // At t=60 the returned TTL counts down from the cached 120.
+        let result = cache
+            .get(&query, now + Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.answers.first().unwrap().ttl, 60);
+
+        // At t=121: cache miss.
+        assert!(cache.get(&query, now + Duration::from_secs(121)).is_none());
+    }
+
+    #[test]
+    fn test_authority_ttl_does_not_shorten_answer_cache() {
+        // Regression test: authority section records (NS, SOA) with short TTLs must
+        // not reduce the cache lifetime of positive answers when answer records
+        // are present.
+        let now = Instant::now();
+
+        let name = Name::from_str("api.example.com.").unwrap();
+        let query = Query::new(name.clone(), RecordType::AAAA);
+
+        let mut message = Message::response(0, OpCode::Query);
+        // Answer: AAAA record with TTL=120
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            120,
+            RData::AAAA(AAAA::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+        ));
+        // Authority: NS record with TTL=30 (much shorter)
+        message.add_authority(Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            30,
+            RData::NS(NS(Name::from_str("ns1.example.com.").unwrap())),
+        ));
+
+        let ttls = TtlConfig::from(TtlBounds {
+            positive_min_ttl: Some(Duration::from_secs(3600)),
+            positive_max_ttl: Some(Duration::from_secs(28800)),
+            ..TtlBounds::default()
+        });
+        let cache = ResponseCache::new(1, ttls);
+
+        cache.insert(query.clone(), Ok(message), now);
+
+        // Cache should be valid for 3600s (answer TTL=120 raised to min_ttl=3600),
+        // NOT 30s from the authority NS record.
+        let valid_until = cache.cache.get(&query).unwrap().valid_until;
+        assert_eq!(valid_until, now + Duration::from_secs(3600));
+
+        // At t=130 (past the original authority TTL of 30): still a cache hit.
+        let result = cache
+            .get(&query, now + Duration::from_secs(130))
+            .unwrap()
+            .unwrap();
+        // AAAA answer TTL counts down from 3600.
+        assert_eq!(result.answers.first().unwrap().ttl, 3470);
+
+        // At t=3601: cache miss.
+        assert!(cache.get(&query, now + Duration::from_secs(3601)).is_none());
+    }
+
+    #[test]
     fn test_negative_min_ttl() {
         let now = Instant::now();
 
         let name = Name::from_str("www.example.com.").unwrap();
-        let query = Query::query(name.clone(), RecordType::A);
+        let query = Query::new(name.clone(), RecordType::A);
 
         // Configure the cache with a minimum TTL of 2 seconds.
         let ttls = TtlConfig::from(TtlBounds {
@@ -540,7 +735,7 @@ mod tests {
         let now = Instant::now();
 
         let name = Name::from_str("www.example.com.").unwrap();
-        let query = Query::query(name.clone(), RecordType::A);
+        let query = Query::new(name.clone(), RecordType::A);
         // Record should have TTL of 62 seconds.
         let mut message = Message::response(0, OpCode::Query);
         message.add_answer(Record::from_rdata(
@@ -582,7 +777,7 @@ mod tests {
         let now = Instant::now();
 
         let name = Name::from_str("www.example.com.").unwrap();
-        let query = Query::query(name.clone(), RecordType::A);
+        let query = Query::new(name.clone(), RecordType::A);
 
         // Configure the cache with a maximum TTL of 60 seconds.
         let ttls = TtlConfig::from(TtlBounds {
@@ -614,7 +809,7 @@ mod tests {
         let now = Instant::now();
 
         let name = Name::from_str("www.example.com.").unwrap();
-        let query = Query::query(name.clone(), RecordType::A);
+        let query = Query::new(name.clone(), RecordType::A);
         let mut message = Message::response(0, OpCode::Query);
         message.add_answer(Record::from_rdata(
             name.clone(),
@@ -626,7 +821,7 @@ mod tests {
 
         let result = cache.get(&query, now).unwrap();
         let cache_message = result.unwrap();
-        assert_eq!(cache_message.answers(), message.answers());
+        assert_eq!(cache_message.answers, message.answers);
     }
 
     #[test]
@@ -634,7 +829,7 @@ mod tests {
         subscribe();
         let now = Instant::now();
 
-        let query = Query::query(
+        let query = Query::new(
             Name::from_str("www.example.com.").unwrap(),
             RecordType::AAAA,
         );
@@ -660,7 +855,7 @@ mod tests {
         let now = Instant::now();
 
         let name = Name::from_str("www.example.com.").unwrap();
-        let query = Query::query(name.clone(), RecordType::A);
+        let query = Query::new(name.clone(), RecordType::A);
         let mut message = Message::response(0, OpCode::Query);
         message.add_answer(Record::from_rdata(
             name.clone(),
@@ -672,8 +867,8 @@ mod tests {
 
         let result = cache.get(&query, now + Duration::from_secs(2)).unwrap();
         let cache_message = result.unwrap();
-        let record = cache_message.answers().first().unwrap();
-        assert_eq!(record.ttl(), 8);
+        let record = cache_message.answers.first().unwrap();
+        assert_eq!(record.ttl, 8);
     }
 
     #[test]
@@ -683,7 +878,7 @@ mod tests {
         let name = Name::from_str("www.example.com.")?;
         let ns_name = Name::from_str("ns1.example.com")?;
         let zone_name = name.base_name();
-        let query = Query::query(name.clone(), RecordType::AAAA);
+        let query = Query::new(name.clone(), RecordType::AAAA);
 
         let mut norecs = NoRecords::new(query.clone(), ResponseCode::NXDomain);
         norecs.negative_ttl = Some(10);
@@ -719,7 +914,7 @@ mod tests {
         let Some(soa) = no_records.soa.clone() else {
             panic!("no SOA in NoRecordsFound");
         };
-        assert_eq!(soa.ttl(), 10);
+        assert_eq!(soa.ttl, 10);
 
         let cache_err = cache
             .get(&query, now + Duration::from_secs(2))
@@ -737,9 +932,9 @@ mod tests {
         };
 
         assert_eq!(*negative_ttl, 8);
-        assert_eq!(soa.ttl(), 8);
-        assert_eq!(authorities[0].ttl(), 8);
-        assert_eq!(ns[0].ns.ttl(), 8);
+        assert_eq!(soa.ttl, 8);
+        assert_eq!(authorities[0].ttl, 8);
+        assert_eq!(ns[0].ns.ttl, 8);
 
         // Cache should be expired
         assert!(cache.get(&query, now + Duration::from_secs(11)).is_none());
@@ -751,7 +946,7 @@ mod tests {
         let now = Instant::now();
 
         let name = Name::from_str("www.example.com.").unwrap();
-        let query = Query::query(name.clone(), RecordType::A);
+        let query = Query::new(name.clone(), RecordType::A);
 
         // TTL of entry should be 1.
         let mut message = Message::response(0, OpCode::Query);
@@ -782,12 +977,12 @@ mod tests {
         let name = Name::from_str("www.example.com.").unwrap();
 
         // Store records with a TTL of 1 second.
-        let query_a = Query::query(name.clone(), RecordType::A);
+        let query_a = Query::new(name.clone(), RecordType::A);
         let rdata_a = RData::A(A::new(127, 0, 0, 1));
         let mut message_a = Message::response(0, OpCode::Query);
         message_a.add_answer(Record::from_rdata(name.clone(), 1, rdata_a.clone()));
 
-        let query_txt = Query::query(name.clone(), RecordType::TXT);
+        let query_txt = Query::new(name.clone(), RecordType::TXT);
         let rdata_txt = RData::TXT(TXT::new(vec!["data".to_string()]));
         let mut message_txt = Message::response(0, OpCode::Query);
         message_txt.add_answer(Record::from_rdata(name.clone(), 1, rdata_txt.clone()));

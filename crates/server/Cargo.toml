@@ -27,7 +27,7 @@ license.workspace = true
 # Recursive Resolution is Experimental!
 recursor = ["hickory-resolver/recursor"]
 resolver = ["dep:hickory-resolver"]
-sqlite = ["rusqlite"]
+sqlite = ["dep:rusqlite"]
 blocklist = ["resolver"]
 toml = ["dep:toml", "hickory-resolver?/toml"]
 metrics = ["hickory-resolver?/metrics", "dep:metrics"]
@@ -116,13 +116,14 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "sync"] }
 tokio-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
-hickory-proto = { workspace = true, features = ["serde", "text-parsing"] }
+hickory-proto = { workspace = true, features = ["serde"] }
 hickory-net = { workspace = true, features = ["tokio"] }
 hickory-resolver = { workspace = true, features = ["serde", "system-config", "tokio"], optional = true }
 metrics = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true, default-features = false, features = ["std"] }
+hickory-proto = { workspace = true, features = ["serde", "testing"] }
 test-support.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }

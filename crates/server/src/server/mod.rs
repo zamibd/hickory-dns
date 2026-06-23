@@ -45,12 +45,14 @@ use crate::{
         xfer::Protocol,
     },
     proto::{
-        ProtoError,
-        op::{Header, LowerQuery, MessageType, ResponseCode, SerialMessage},
+        op::{
+            Header, LowerQuery, MessageRequest, MessageType, Metadata, OpCode, Queries,
+            ResponseCode, SerialMessage,
+        },
         rr::Record,
         serialize::binary::{BinDecodable, BinDecoder},
     },
-    zone_handler::{MessageRequest, MessageResponseBuilder, Queries},
+    zone_handler::MessageResponseBuilder,
 };
 
 #[cfg(feature = "__https")]
@@ -117,9 +119,19 @@ impl<T: RequestHandler> Server<T> {
     ///   requests within this time period will be closed. In the future it should be
     ///   possible to create long-lived queries, but these should be from trusted sources
     ///   only, this would require some type of whitelisting.
-    pub fn register_listener(&mut self, listener: net::TcpListener, timeout: Duration) {
-        self.join_set
-            .spawn(handle_tcp(listener, timeout, self.context.clone()));
+    /// * `response_buffer_size` - size of the buffer for outgoing responses per connection
+    pub fn register_listener(
+        &mut self,
+        listener: net::TcpListener,
+        timeout: Duration,
+        response_buffer_size: usize,
+    ) {
+        self.join_set.spawn(handle_tcp(
+            listener,
+            timeout,
+            response_buffer_size,
+            self.context.clone(),
+        ));
     }
 
     /// Register a TlsListener to the Server. The TlsListener should already be bound to either an
@@ -490,6 +502,7 @@ async fn handle_udp(
 async fn handle_tcp(
     listener: net::TcpListener,
     timeout: Duration,
+    response_buffer_size: usize,
     cx: Arc<ServerContext<impl RequestHandler>>,
 ) -> Result<(), NetError> {
     debug!("register tcp: {listener:?}");
@@ -526,8 +539,11 @@ async fn handle_tcp(
         inner_join_set.spawn(async move {
             debug!(%src_addr, "accepted TCP request");
             // take the created stream...
-            let (buf_stream, stream_handle) =
-                TcpStream::from_stream(AsyncIoTokioAsStd(tcp_stream), src_addr);
+            let (buf_stream, stream_handle) = TcpStream::from_stream_with_buffer_size(
+                AsyncIoTokioAsStd(tcp_stream),
+                src_addr,
+                response_buffer_size,
+            );
             let mut timeout_stream = TimeoutStream::new(buf_stream, timeout);
 
             while let Some(message) = timeout_stream.next().await {
@@ -668,75 +684,6 @@ pub fn default_tls_server_config(
     Ok(config)
 }
 
-#[derive(Clone)]
-pub(super) struct ReportingResponseHandler<R: ResponseHandler> {
-    pub(super) request_header: Header,
-    queries: Vec<LowerQuery>,
-    pub(super) protocol: Protocol,
-    src_addr: SocketAddr,
-    handler: R,
-    #[cfg(feature = "metrics")]
-    metrics: ResponseHandlerMetrics,
-}
-
-#[async_trait::async_trait]
-impl<R: ResponseHandler> ResponseHandler for ReportingResponseHandler<R> {
-    async fn send_response<'a>(
-        &mut self,
-        response: crate::zone_handler::MessageResponse<
-            '_,
-            'a,
-            impl Iterator<Item = &'a Record> + Send + 'a,
-            impl Iterator<Item = &'a Record> + Send + 'a,
-            impl Iterator<Item = &'a Record> + Send + 'a,
-            impl Iterator<Item = &'a Record> + Send + 'a,
-        >,
-    ) -> Result<ResponseInfo, NetError> {
-        let response_info = self.handler.send_response(response).await?;
-
-        let id = self.request_header.id();
-        let rid = response_info.id();
-        if id != rid {
-            warn!("request id:{id} does not match response id:{rid}");
-            debug_assert_eq!(id, rid, "request id and response id should match");
-        }
-
-        let rflags = response_info.flags();
-        let answer_count = response_info.answer_count();
-        let authority_count = response_info.authority_count();
-        let additional_count = response_info.additional_count();
-        let response_code = response_info.response_code();
-
-        info!(
-            "request:{id} src:{proto}://{addr}#{port} {op} qflags:{qflags} response:{code:?} rr:{answers}/{authorities}/{additionals} rflags:{rflags}",
-            id = rid,
-            proto = self.protocol,
-            addr = self.src_addr.ip(),
-            port = self.src_addr.port(),
-            op = self.request_header.op_code(),
-            qflags = self.request_header.flags(),
-            code = response_code,
-            answers = answer_count,
-            authorities = authority_count,
-            additionals = additional_count,
-            rflags = rflags
-        );
-        for query in self.queries.iter() {
-            info!(
-                "query:{query}:{qtype}:{class}",
-                query = query.name(),
-                qtype = query.query_type(),
-                class = query.query_class()
-            );
-        }
-
-        #[cfg(feature = "metrics")]
-        self.metrics.update(self, &response_info);
-
-        Ok(response_info)
-    }
-}
-
 struct ServerContext<T> {
     handler: T,
     access: AccessControl,
@@ -765,6 +712,49 @@ impl<T: RequestHandler> ServerContext<T> {
         response_handler: impl ResponseHandler,
     ) {
         let mut decoder = BinDecoder::new(&message_bytes);
+        let Ok(header) = Header::read(&mut decoder) else {
+            // This will only fail if the message is less than twelve bytes long. Such messages are
+            // definitely not valid DNS queries, so it should be fine to return without sending a
+            // response.
+            return;
+        };
+
+        if header.metadata.message_type == MessageType::Response {
+            // Don't process response messages to avoid DoS attacks from reflection.
+            return;
+        }
+
+        if matches!(header.metadata.op_code, OpCode::Unknown(_)) {
+            error_response_handler(
+                protocol,
+                src_addr,
+                header,
+                None,
+                ResponseCode::NotImp,
+                "unsupported op code",
+                response_handler,
+            )
+            .await;
+            return;
+        }
+
+        let queries = match Queries::read(&mut decoder, header.counts.queries as usize) {
+            Ok(queries) => queries,
+            Err(error) => {
+                error_response_handler(
+                    protocol,
+                    src_addr,
+                    header,
+                    None,
+                    ResponseCode::FormErr,
+                    error,
+                    response_handler,
+                )
+                .await;
+                return;
+            }
+        };
+
         if !self.access.allow(src_addr.ip()) {
             info!(
                 "request:Refused src:{proto}://{addr}#{port}",
@@ -773,21 +763,11 @@ impl<T: RequestHandler> ServerContext<T> {
                 port = src_addr.port(),
             );
 
-            let Ok(header) = Header::read(&mut decoder) else {
-                // This will only fail if the message is less than twelve bytes long. Such messages are
-                // definitely not valid DNS queries, so it should be fine to return without sending a
-                // response.
-                return;
-            };
-            let queries = match Queries::read(&mut decoder, header.query_count() as usize) {
-                Ok(queries) => queries,
-                Err(_) => Queries::empty(),
-            };
             error_response_handler(
                 protocol,
                 src_addr,
                 header,
-                queries,
+                Some(queries),
                 ResponseCode::Refused,
                 "request refused",
                 response_handler,
@@ -798,22 +778,20 @@ impl<T: RequestHandler> ServerContext<T> {
         }
 
         // Attempt to decode the message
-        let request = match MessageRequest::read(&mut decoder) {
+        let request = match MessageRequest::read_with_queries(&mut decoder, queries.clone(), header)
+        {
             Ok(message) => Request {
                 message,
                 raw: message_bytes,
                 src: src_addr,
                 protocol,
             },
-            Err(ProtoError::FormError { header, error }) => {
-                // We failed to parse the request due to some issue in the message, but the header is available, so we can respond
-                let queries = Queries::empty();
-
+            Err(error) => {
                 error_response_handler(
                     protocol,
                     src_addr,
                     header,
-                    queries,
+                    Some(queries),
                     ResponseCode::FormErr,
                     error,
                     response_handler,
@@ -822,29 +800,16 @@ impl<T: RequestHandler> ServerContext<T> {
 
                 return;
             }
-            Err(error) => {
-                info!(
-                    "request:Failed src:{proto}://{addr}#{port} error:{error}",
-                    proto = protocol,
-                    addr = src_addr.ip(),
-                    port = src_addr.port(),
-                );
-                return;
-            }
         };
 
-        if request.message.message_type() == MessageType::Response {
-            // Don't process response messages to avoid DoS attacks from reflection.
-            return;
-        }
-
-        let id = request.message.id();
-        let qflags = request.message.header().flags();
-        let qop_code = request.message.op_code();
-        let message_type = request.message.message_type();
+        let id = request.message.metadata.id;
+        let qflags = request.message.metadata.flags();
+        let qop_code = request.message.metadata.op_code;
+        let message_type = request.message.metadata.message_type;
         let is_dnssec = request
             .message
-            .edns()
+            .edns
+            .as_ref()
             .is_some_and(|edns| edns.flags().dnssec_ok);
 
         debug!(
@@ -858,20 +823,19 @@ impl<T: RequestHandler> ServerContext<T> {
             op = qop_code,
             qflags = qflags
         );
-        for query in request.queries().iter() {
-            debug!(
-                "query:{query}:{qtype}:{class}",
-                query = query.name(),
-                qtype = query.query_type(),
-                class = query.query_class()
-            );
-        }
+
+        let query = &*request.message.queries;
+        debug!(
+            "query:{query}:{qtype}:{class}",
+            query = query.name(),
+            qtype = query.query_type(),
+            class = query.query_class(),
+        );
 
         // The reporter will handle making sure to log the result of the request
-        let queries = request.queries().to_vec();
         let reporter = ReportingResponseHandler {
-            request_header: *request.header(),
-            queries,
+            request_meta: request.metadata,
+            query: Some(query.clone()),
             protocol: request.protocol(),
             src_addr: request.src(),
             handler: response_handler,
@@ -890,7 +854,7 @@ async fn error_response_handler(
     protocol: Protocol,
     src_addr: SocketAddr,
     header: Header,
-    queries: Queries,
+    queries: Option<Queries>,
     response_code: ResponseCode,
     error: impl fmt::Display,
     response_handler: impl ResponseHandler,
@@ -898,20 +862,20 @@ async fn error_response_handler(
     // debug for more info on why the message parsing failed
     debug!(
         "request:{id} src:{proto}://{addr}#{port} type:{message_type} {op}:{response_code}:{error}",
-        id = header.id(),
+        id = header.id,
         proto = protocol,
         addr = src_addr.ip(),
         port = src_addr.port(),
-        message_type = header.message_type(),
-        op = header.op_code(),
+        message_type = header.message_type,
+        op = header.op_code,
         response_code = response_code,
         error = error,
     );
 
     // The reporter will handle making sure to log the result of the request
     let mut reporter = ReportingResponseHandler {
-        request_header: header,
-        queries: queries.queries().to_vec(),
+        request_meta: header.metadata,
+        query: queries.as_ref().map(|q| (**q).clone()),
         protocol,
         src_addr,
         handler: response_handler,
@@ -919,13 +883,87 @@ async fn error_response_handler(
         metrics: ResponseHandlerMetrics::default(),
     };
 
-    let response = MessageResponseBuilder::new(&queries, None);
+    let response = match queries.as_ref() {
+        Some(queries) => MessageResponseBuilder::new(queries, None),
+        None => MessageResponseBuilder::no_queries(None),
+    };
+
     let result = reporter
         .send_response(response.error_msg(&header, response_code))
         .await;
 
     if let Err(error) = result {
         warn!(%error, "failed to return FormError to client");
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ReportingResponseHandler<R: ResponseHandler> {
+    pub(super) request_meta: Metadata,
+    query: Option<LowerQuery>,
+    pub(super) protocol: Protocol,
+    src_addr: SocketAddr,
+    handler: R,
+    #[cfg(feature = "metrics")]
+    metrics: ResponseHandlerMetrics,
+}
+
+#[async_trait::async_trait]
+impl<R: ResponseHandler> ResponseHandler for ReportingResponseHandler<R> {
+    async fn send_response<'a>(
+        &mut self,
+        response: crate::zone_handler::MessageResponse<
+            '_,
+            'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+        >,
+    ) -> Result<ResponseInfo, NetError> {
+        let response_info = self.handler.send_response(response).await?;
+
+        let id = self.request_meta.id;
+        let rid = response_info.id;
+        if id != rid {
+            warn!("request id:{id} does not match response id:{rid}");
+            debug_assert_eq!(id, rid, "request id and response id should match");
+        }
+
+        let rflags = response_info.flags();
+        let answer_count = response_info.counts().answers;
+        let authority_count = response_info.counts().authorities;
+        let additional_count = response_info.counts().additionals;
+        let response_code = response_info.response_code;
+
+        info!(
+            "request:{id} src:{proto}://{addr}#{port} {op} qflags:{qflags} response:{code:?} rr:{answers}/{authorities}/{additionals} rflags:{rflags}",
+            id = rid,
+            proto = self.protocol,
+            addr = self.src_addr.ip(),
+            port = self.src_addr.port(),
+            op = self.request_meta.op_code,
+            qflags = self.request_meta.flags(),
+            code = response_code,
+            answers = answer_count,
+            authorities = authority_count,
+            additionals = additional_count,
+            rflags = rflags
+        );
+
+        if let Some(query) = &self.query {
+            info!(
+                "query:{query}:{qtype}:{class}",
+                query = query.name(),
+                qtype = query.query_type(),
+                class = query.query_class(),
+            );
+        }
+
+        #[cfg(feature = "metrics")]
+        self.metrics.update(self, &response_info);
+
+        Ok(response_info)
     }
 }
 
@@ -971,11 +1009,9 @@ fn sanitize_src_address(src: SocketAddr) -> Result<(), String> {
     }
 }
 
+/// Returns `true` if an `accept()` error means the listener itself is no longer usable.
 fn is_unrecoverable_socket_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotConnected | io::ErrorKind::ConnectionAborted
-    )
+    matches!(err.kind(), io::ErrorKind::NotConnected)
 }
 
 #[cfg(test)]
@@ -1097,6 +1133,7 @@ mod tests {
             server.register_listener(
                 TcpListener::bind(self.tcp_addr).await.unwrap(),
                 Duration::from_secs(1),
+                32,
             );
 
             #[cfg(feature = "__tls")]

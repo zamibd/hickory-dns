@@ -12,8 +12,8 @@ use core::ops::{Deref, DerefMut};
 use core::time::Duration;
 
 #[cfg(feature = "std")]
-use crate::op::{DEFAULT_RETRY_FLOOR, Edns};
-use crate::op::{Message, Query};
+use super::{DEFAULT_RETRY_FLOOR, Edns};
+use super::{Message, Query, edns::DEFAULT_MAX_PAYLOAD_LEN};
 
 /// A set of options for expressing options to how requests should be treated
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,16 @@ pub struct DnsRequestOptions {
     // TODO: add EDNS options here?
     /// When true, will add EDNS options to the request.
     pub use_edns: bool,
+    /// EDNS UDP payload size.
+    ///
+    /// Sets the requestor's UDP payload size in the EDNS(0) OPT pseudo-RR in outgoing requests.
+    /// This tells other servers when they need to truncate their responses. Smaller payload sizes
+    /// require more queries with large responses to be retried over TCP, while larger payload sizes
+    /// lead to large responses being fragmented or dropped if they exceed the MTU of a network.
+    ///
+    /// See <https://www.dnsflagday.net/2020/> and
+    /// [RFC 9715](https://www.rfc-editor.org/rfc/rfc9715.html) for discussion.
+    pub edns_payload_len: u16,
     /// When true, sets the DO bit in the EDNS options
     pub edns_set_dnssec_ok: bool,
     /// Specifies maximum request depth for DNSSEC validation.
@@ -42,7 +52,8 @@ impl Default for DnsRequestOptions {
     fn default() -> Self {
         Self {
             max_request_depth: 26,
-            use_edns: false,
+            use_edns: true,
+            edns_payload_len: DEFAULT_MAX_PAYLOAD_LEN,
             edns_set_dnssec_ok: false,
             recursion_desired: true,
             #[cfg(feature = "std")]
@@ -77,15 +88,14 @@ impl DnsRequest {
             query.name.randomize_label_case();
         }
 
-        message
-            .add_query(query)
-            .set_recursion_desired(options.recursion_desired);
+        message.queries.push(query);
+        message.metadata.recursion_desired = options.recursion_desired;
 
         if options.use_edns {
             message
-                .extensions_mut()
+                .edns
                 .get_or_insert_with(Edns::new)
-                .set_max_payload(MAX_PAYLOAD_LEN)
+                .set_max_payload(options.edns_payload_len)
                 .set_dnssec_ok(options.edns_set_dnssec_ok);
         }
 
@@ -147,8 +157,31 @@ impl From<Message> for DnsRequest {
     }
 }
 
-// TODO: this should be configurable
-// > An EDNS buffer size of 1232 bytes will avoid fragmentation on nearly all current networks.
-// https://dnsflagday.net/2020/
-#[cfg(feature = "std")]
-const MAX_PAYLOAD_LEN: u16 = 1232;
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::rr::{Name, RecordType};
+
+    #[test]
+    fn from_query_default_includes_edns() {
+        let query = Query::new(Name::from_ascii("example.com.").unwrap(), RecordType::A);
+        let request = DnsRequest::from_query(query, DnsRequestOptions::default());
+        assert!(request.edns.is_some());
+        assert_eq!(request.max_payload(), DEFAULT_MAX_PAYLOAD_LEN);
+    }
+
+    #[test]
+    fn from_query_edns_disabled_no_opt() {
+        let query = Query::new(Name::from_ascii("example.com.").unwrap(), RecordType::A);
+        let request = DnsRequest::from_query(
+            query,
+            DnsRequestOptions {
+                use_edns: false,
+                ..DnsRequestOptions::default()
+            },
+        );
+
+        assert!(request.edns.is_none());
+        assert_eq!(request.max_payload(), 512);
+    }
+}

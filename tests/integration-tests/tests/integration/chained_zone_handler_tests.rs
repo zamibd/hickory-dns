@@ -227,10 +227,7 @@ impl ZoneHandler for TestZoneHandler {
         request: &Request,
         lookup_options: LookupOptions,
     ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
-        let request_info = match request.request_info() {
-            Ok(info) => info,
-            Err(e) => return (LookupControlFlow::Break(Err(e)), None),
-        };
+        let request_info = request.request_info();
         (
             self.lookup(
                 request_info.query.name(),
@@ -257,7 +254,6 @@ impl ZoneHandler for TestZoneHandler {
         (res, None)
     }
 
-    #[cfg(feature = "metrics")]
     fn metrics_label(&self) -> &'static str {
         "test"
     }
@@ -336,11 +332,11 @@ fn inner_lookup(
 async fn do_query(catalog: &Catalog, query_name: &str) -> (ResponseInfo, TestResponseHandler) {
     let mut question = Message::query();
 
-    let mut query: Query = Query::new();
+    let mut query: Query = Query::root();
     query.set_name(Name::from_ascii(query_name).unwrap());
     question.add_query(query);
-    question.set_recursion_desired(true);
-    question.set_authentic_data(true);
+    question.metadata.recursion_desired = true;
+    question.metadata.authentic_data = true;
 
     let question_bytes = question.to_bytes().unwrap();
     let question_req =
@@ -360,18 +356,18 @@ async fn basic_test(catalog: &Catalog, query_name: &'static str, answer: A) {
     let (_, response_handler) = do_query(catalog, query_name).await;
     let result = response_handler.into_message().await;
 
-    let answers: &[Record] = result.answers();
+    let answers = result.answers;
 
-    assert_eq!(result.response_code(), ResponseCode::NoError);
-    assert_eq!(result.message_type(), MessageType::Response);
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(result.metadata.message_type, MessageType::Response);
     assert!(!answers.is_empty());
     assert_eq!(answers.first().unwrap().record_type(), RecordType::A);
-    assert_eq!(answers.first().unwrap().data(), &RData::A(answer));
+    assert_eq!(answers.first().unwrap().data, RData::A(answer));
 }
 
 async fn error_test(catalog: &Catalog, query_name: &str, r_code: ResponseCode) {
     let (res, _) = do_query(catalog, query_name).await;
 
-    assert_eq!(res.response_code(), r_code);
-    assert_eq!(res.answer_count(), 0);
+    assert_eq!(res.response_code, r_code);
+    assert_eq!(res.counts().answers, 0);
 }

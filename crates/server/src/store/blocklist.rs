@@ -10,7 +10,7 @@
 #![cfg(feature = "blocklist")]
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     fs::File,
     io::{self, Read},
     net::{Ipv4Addr, Ipv6Addr},
@@ -65,7 +65,7 @@ use crate::{
 /// to drop queries pre-emptively, as in the first example.
 pub struct BlocklistZoneHandler {
     origin: LowerName,
-    blocklist: HashMap<LowerName, bool>,
+    blocklist: HashSet<LowerName>,
     wildcard_match: bool,
     min_wildcard_depth: u8,
     sinkhole_ipv4: Ipv4Addr,
@@ -89,7 +89,7 @@ impl BlocklistZoneHandler {
 
         let mut handler = Self {
             origin: origin.into(),
-            blocklist: HashMap::new(),
+            blocklist: HashSet::new(),
             wildcard_match: config.wildcard_match,
             min_wildcard_depth: config.min_wildcard_depth,
             sinkhole_ipv4: config.sinkhole_ipv4.unwrap_or(Ipv4Addr::UNSPECIFIED),
@@ -132,10 +132,7 @@ impl BlocklistZoneHandler {
         }
 
         #[cfg(feature = "metrics")]
-        handler
-            .metrics
-            .entries
-            .set(handler.blocklist.keys().len() as f64);
+        handler.metrics.entries.set(handler.blocklist.len() as f64);
 
         Ok(handler)
     }
@@ -239,19 +236,24 @@ impl BlocklistZoneHandler {
                 None => entry,
             };
 
-            let Ok(mut name) = LowerName::from_str(name) else {
-                warn!("unable to derive LowerName for blocklist entry '{name}'; skipping entry");
+            let Ok(mut name) = Name::from_str(name) else {
+                warn!("unable to parse Name for blocklist entry '{name}'; skipping entry");
                 continue;
             };
 
             trace!("inserting blocklist entry {name}");
 
-            // The boolean value is not significant; only the key is used.
             name.set_fqdn(true);
-            self.blocklist.insert(name, true);
+            let lower_name = LowerName::from(name);
+            self.blocklist.insert(lower_name);
         }
 
         Ok(())
+    }
+
+    /// Number of unique blocklist entries currently loaded in memory.
+    pub fn entry_count(&self) -> usize {
+        self.blocklist.len()
     }
 
     /// Build a wildcard match list for a given host
@@ -281,7 +283,7 @@ impl BlocklistZoneHandler {
 
         match_list
             .iter()
-            .any(|entry| self.blocklist.contains_key(entry))
+            .any(|entry| self.blocklist.contains(entry))
     }
 
     /// Generate a BlocklistLookup to return on a blocklist match.  This will return a lookup with
@@ -312,7 +314,7 @@ impl BlocklistZoneHandler {
         }
 
         Lookup::new_with_deadline(
-            Query::query(name.clone(), rtype),
+            Query::new(name.clone(), rtype),
             records,
             Instant::now() + Duration::from_secs(u64::from(self.ttl)),
         )
@@ -425,27 +427,6 @@ impl ZoneHandler for BlocklistZoneHandler {
         }
     }
 
-    async fn search(
-        &self,
-        request: &Request,
-        lookup_options: LookupOptions,
-    ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
-        let request_info = match request.request_info() {
-            Ok(info) => info,
-            Err(e) => return (LookupControlFlow::Break(Err(e)), None),
-        };
-        (
-            self.lookup(
-                request_info.query.name(),
-                request_info.query.query_type(),
-                Some(&request_info),
-                lookup_options,
-            )
-            .await,
-            None,
-        )
-    }
-
     async fn zone_transfer(
         &self,
         _request: &Request,
@@ -484,7 +465,6 @@ impl ZoneHandler for BlocklistZoneHandler {
         None
     }
 
-    #[cfg(feature = "metrics")]
     fn metrics_label(&self) -> &'static str {
         "blocklist"
     }
@@ -754,6 +734,46 @@ mod test {
         .await;
     }
 
+    #[test]
+    fn test_blocklist_entry_count() {
+        subscribe();
+        let config = BlocklistConfig {
+            wildcard_match: true,
+            min_wildcard_depth: 2,
+            lists: vec!["default/blocklist.txt".to_string()],
+            sinkhole_ipv4: None,
+            sinkhole_ipv6: None,
+            block_message: None,
+            ttl: 86_400,
+            consult_action: BlocklistConsultAction::Disabled,
+            log_clients: true,
+        };
+
+        let zh = BlocklistZoneHandler::try_from_config(
+            Name::root(),
+            config,
+            Some(Path::new("../../tests/test-data/test_configs/")),
+        )
+        .expect("unable to create config");
+
+        assert_eq!(zh.entry_count(), 4);
+    }
+
+    #[test]
+    fn test_blocklist_entry_count_default() {
+        subscribe();
+        let config = BlocklistConfig::default();
+
+        let zh = BlocklistZoneHandler::try_from_config(
+            Name::root(),
+            config,
+            Some(Path::new("../../tests/test-data/test_configs/")),
+        )
+        .expect("unable to create config");
+
+        assert_eq!(zh.entry_count(), 0);
+    }
+
     async fn basic_test(
         ao: &Arc<dyn ZoneHandler>,
         query: &'static str,
@@ -789,7 +809,7 @@ mod test {
         if !lookup.iter().all(|x| match x.record_type() {
             RecordType::TXT => {
                 if let Some(msg) = &msg {
-                    x.data().to_string() == *msg
+                    x.data.to_string() == *msg
                 } else {
                     false
                 }
@@ -799,14 +819,14 @@ mod test {
                     panic!("expected to validate record IPv6, but None was passed");
                 };
 
-                x.name() == &Name::from_str(query).unwrap() && x.data() == &RData::AAAA(rec_ip)
+                x.name == Name::from_str(query).unwrap() && x.data == RData::AAAA(rec_ip)
             }
             _ => {
                 let Some(rec_ip) = ipv4 else {
                     panic!("expected to validate record IPv4, but None was passed");
                 };
 
-                x.name() == &Name::from_str(query).unwrap() && x.data() == &RData::A(rec_ip)
+                x.name == Name::from_str(query).unwrap() && x.data == RData::A(rec_ip)
             }
         }) {
             panic!("{query} lookup data is incorrect.");

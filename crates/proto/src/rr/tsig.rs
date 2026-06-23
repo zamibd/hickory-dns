@@ -42,7 +42,7 @@ use crate::op::{Message, OpCode};
 use crate::rr::Record;
 use crate::rr::{Name, RecordType};
 #[cfg(feature = "__dnssec")]
-use crate::serialize::binary::BinEncoder;
+use crate::serialize::binary::{BinEncodable, BinEncoder};
 
 /// Context for a TSIG response, used to construct a TSIG response signer
 pub struct TSigResponseContext {
@@ -111,7 +111,7 @@ impl TSigResponseContext {
 
                 let mut stub_tsig = TSIG::stub(self.request_id, self.time, &signer);
                 if let Some(err) = error {
-                    stub_tsig.set_error(err);
+                    stub_tsig.error = Some(err);
                 }
 
                 let tbs_tsig_encoded =
@@ -129,7 +129,7 @@ impl TSigResponseContext {
             }
             TsigResponseKind::BadSignature { signer } => {
                 let mut stub_tsig = TSIG::stub(self.request_id, self.time, &signer);
-                stub_tsig.set_error(TsigError::BadSig);
+                stub_tsig.error = Some(TsigError::BadSig);
                 Ok(Box::new(make_tsig_record(
                     signer.signer_name().clone(),
                     stub_tsig,
@@ -254,11 +254,11 @@ impl TSigner {
 
     /// Returns true if the `TSigner` should sign the given `Message`
     pub fn should_sign_message(&self, message: &Message) -> bool {
-        [OpCode::Update, OpCode::Notify].contains(&message.op_code())
+        [OpCode::Update, OpCode::Notify].contains(&message.op_code)
             || message
-                .queries()
+                .queries
                 .iter()
-                .any(|q| [RecordType::AXFR, RecordType::IXFR].contains(&q.query_type()))
+                .any(|q| [RecordType::AXFR, RecordType::IXFR].contains(&q.query_type))
     }
 
     /// Verify the message is correctly signed
@@ -291,11 +291,11 @@ impl TSigner {
         first_message: bool,
     ) -> Result<(Vec<u8>, u64, Range<u64>), DnsSecError> {
         let (tbv, record) = signed_bitmessage_to_buf(message, previous_hash, first_message)?;
-        let tsig = record.data();
+        let tsig = record.data;
 
         // https://tools.ietf.org/html/rfc8945#section-5.2
         // 1.  Check key
-        if record.name() != &self.0.signer_name || tsig.algorithm() != &self.0.algorithm {
+        if record.name != self.0.signer_name || tsig.algorithm != self.0.algorithm {
             return Err(DnsSecError::TsigWrongKey);
         }
 
@@ -305,13 +305,12 @@ impl TSigner {
         // While the RFC supports this, we take a conservative approach and do not. Truncated
         // MAC tags offer less security than their full-width counterparts, and the spec includes
         // them only for backwards compatibility.
-        if tsig.mac().len() < tsig.algorithm().output_len()? {
+        if tsig.mac.len() < tsig.algorithm.output_len()? {
             return Err(DnsSecError::from(
                 "Please file an issue with https://github.com/hickory-dns/hickory-dns to support truncated HMACs with TSIG",
             ));
         }
-        let mac = tsig.mac();
-        self.verify(&tbv, mac)?;
+        self.verify(&tbv, &tsig.mac)?;
 
         // 3.  Check time values
         // Since we don't have a time source to use here we instead defer this to the caller.
@@ -320,11 +319,11 @@ impl TSigner {
         // We have already rejected truncated MACs so this step is not applicable.
 
         Ok((
-            tsig.mac().to_vec(),
-            tsig.time(),
+            tsig.mac.to_vec(),
+            tsig.time,
             Range {
-                start: tsig.time() - tsig.fudge() as u64,
-                end: tsig.time() + tsig.fudge() as u64,
+                start: tsig.time - tsig.fudge as u64,
+                end: tsig.time + tsig.fudge as u64,
             },
         ))
     }
@@ -354,9 +353,9 @@ impl TSigner {
         let mut encoder = BinEncoder::new(&mut tbs_buf);
 
         debug_assert!(previous_mac.len() <= u16::MAX as usize); // Shouldn't happen for supported algorithms.
-        encoder.emit_u16(previous_mac.len() as u16)?;
-        encoder.emit_vec(previous_mac)?;
-        encoder.emit_vec(encoded_response)?;
+        (previous_mac.len() as u16).emit(&mut encoder)?;
+        encoder.emit_slice(previous_mac)?;
+        encoder.emit_slice(encoded_response)?;
         stub_tsig.emit_tsig_for_mac(&mut encoder, self.signer_name())?;
 
         Ok(tbs_buf)
@@ -371,7 +370,7 @@ impl TSigner {
     ) -> ProtoResult<(Box<Record<TSIG>>, Option<TSigVerifier>)> {
         debug!("signing message: {:?}", message);
 
-        let pre_tsig = TSIG::stub(message.id(), current_time, self);
+        let pre_tsig = TSIG::stub(message.id, current_time, self);
         let signature = self
             .sign(&message_tbs(message, &pre_tsig, &self.0.signer_name)?)
             .map_err(|err| ProtoError::from(err.to_string()))?;
@@ -464,7 +463,7 @@ mod tests {
         let origin: Name = Name::parse("example.com.", None).unwrap();
         let key_name: Name = Name::from_ascii("key_name.").unwrap();
         let mut question = Message::query();
-        let mut query: Query = Query::new();
+        let mut query: Query = Query::root();
         query.set_name(origin);
         question.add_query(query);
 
@@ -494,7 +493,7 @@ mod tests {
         let origin: Name = Name::parse("example.com.", None).unwrap();
         let key_name: Name = Name::from_ascii("key_name.").unwrap();
         let mut question = Message::query();
-        let mut query: Query = Query::new();
+        let mut query: Query = Query::root();
         query.set_name(origin);
         question.add_query(query);
 
@@ -522,11 +521,11 @@ mod tests {
     fn test_sign_and_verify_message_tsig_reject_keyname() {
         let (mut question, signer) = get_message_and_signer();
 
-        let other_name: Name = Name::from_ascii("other_name.").unwrap();
+        let other_name = Name::from_ascii("other_name.").unwrap();
         let Some(mut signature) = question.take_signature() else {
             panic!("should have TSIG signed");
         };
-        signature.set_name(other_name);
+        signature.name = other_name;
         question.set_signature(signature);
 
         assert!(
@@ -540,7 +539,7 @@ mod tests {
     fn test_sign_and_verify_message_tsig_reject_invalid_mac() {
         let (mut question, signer) = get_message_and_signer();
 
-        let mut query: Query = Query::new();
+        let mut query: Query = Query::root();
         let origin: Name = Name::parse("example.net.", None).unwrap();
         query.set_name(origin);
         question.add_query(query);

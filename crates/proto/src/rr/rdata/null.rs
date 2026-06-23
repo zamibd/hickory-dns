@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, Restrict},
+    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, DecodeError, Restrict},
 };
 
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
@@ -37,8 +37,10 @@ use crate::{
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct NULL {
-    anything: Vec<u8>,
+    /// The buffer stored in the NULL
+    pub anything: Vec<u8>,
 }
 
 impl NULL {
@@ -56,25 +58,16 @@ impl NULL {
 
         Self { anything }
     }
-
-    /// Returns the buffer stored in the NULL
-    pub fn anything(&self) -> &[u8] {
-        &self.anything
-    }
 }
 
 impl BinEncodable for NULL {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        for b in self.anything() {
-            encoder.emit(*b)?;
-        }
-
-        Ok(())
+        encoder.emit_slice(&self.anything)
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for NULL {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         let rdata_length = length.map(|u| u as usize).unverified(/*any u16 is valid*/);
         if rdata_length > 0 {
             let anything = decoder.read_vec(rdata_length)?.unverified(/*any byte array is good*/);

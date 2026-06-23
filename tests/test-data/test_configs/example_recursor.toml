@@ -1,3 +1,34 @@
+## UDP socket buffer configuration
+## Under high query load, increasing buffer sizes and the count of bound UDP
+## sockets can help prevent packet loss.
+##
+## For buffer sizes, if not specified, the operating system defaults are used.
+## Note: The kernel may cap the actual buffer size based on system limits
+## (e.g., net.core.rmem_max and net.core.wmem_max on Linux).
+##
+## For socket count, if not specified, 1 socket is used.
+# [udp_socket]
+# recv_buffer_size = 4194304  # 4MB
+# send_buffer_size = 4194304  # 4MB
+# sockets = 1
+
+## TCP socket configuration
+## Under high connection rates, increasing the listen backlog can help prevent
+## connection drops when the server cannot accept connections fast enough.
+## This is particularly useful for recursive resolvers handling large query
+## volumes over TCP.
+##
+## Note: The kernel may cap the realized backlog size based on system limits
+## (e.g., net.core.somaxconn and net.ipv[4|6].tcp_max_syn_backlog on Linux).
+##
+## listen_backlog: defaults to 128.
+## response_buffer_size: maximum number of responses that can be queued for
+##   sending on a single TCP connection. Increase this for high-throughput
+##   deployments to prevent responses from being dropped. Defaults to 32.
+# [tcp_socket]
+# listen_backlog = 128
+# response_buffer_size = 1024
+
 ## Default zones, these should be present on all nameservers, except in rare
 ##  configuration cases
 [[zones]]
@@ -42,6 +73,7 @@ ns_cache_size = 1024
 response_cache_size = 1048576
 recursion_limit = 24
 ns_recursion_limit = 24
+edns_payload_len = 1232
 
 ## allow_answers: these networks will override entries in deny_answers and allow you to make
 ## granular exceptions to networks you otherwise want to filter from upstream responses.  This

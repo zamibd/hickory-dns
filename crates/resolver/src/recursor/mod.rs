@@ -31,14 +31,14 @@ use crate::metrics::recursor::RecursorMetrics;
 use crate::net::runtime::TokioRuntimeProvider;
 #[cfg(feature = "serde")]
 use crate::proto::{
-    rr::{RData, Record, RecordSet},
+    rr::{RData, RecordSet},
     serialize::txt::{ParseError, Parser},
 };
 use crate::{
     ConnectionProvider, NameServerTransportState, PoolContext, TlsConfig, TtlConfig,
     config::OpportunisticEncryption,
     proto::{
-        op::{Message, Query},
+        op::{DEFAULT_MAX_PAYLOAD_LEN, Message, Query},
         rr::Name,
     },
 };
@@ -102,7 +102,12 @@ impl<P: ConnectionProvider> Recursor<P> {
             None => Cow::Borrowed(&config.roots),
         };
 
-        let roots_str = fs::read_to_string(path.as_ref())?;
+        let roots_str = fs::read_to_string(path.as_ref()).map_err(|e| {
+            format!(
+                "failed to read roots file '{path}': {e}",
+                path = path.display()
+            )
+        })?;
         let (_zone, roots_zone) =
             Parser::new(roots_str, Some(path.into_owned()), Some(Name::root()))
                 .parse()
@@ -111,7 +116,7 @@ impl<P: ConnectionProvider> Recursor<P> {
         let root_addrs = roots_zone
             .values()
             .flat_map(RecordSet::records_without_rrsigs)
-            .map(Record::data)
+            .map(|r| &r.data)
             .filter_map(RData::ip_addr) // we only want IPs
             .collect::<Vec<_>>();
 
@@ -340,7 +345,7 @@ impl<P: ConnectionProvider> Recursor<P> {
         request_time: Instant,
         query_has_dnssec_ok: bool,
     ) -> Result<Message, RecursorError> {
-        if !query.name().is_fqdn() {
+        if !query.name.is_fqdn() {
             return Err(RecursorError::from(
                 "query's domain name must be fully qualified",
             ));
@@ -465,11 +470,11 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
 
             let none_indeterminate = response
                 .all_sections()
-                .all(|record| !record.proof().is_indeterminate());
+                .all(|record| !record.proof.is_indeterminate());
 
             // if the cached response is a referral, or if any record is indeterminate, fall
             // through and perform DNSSEC validation
-            if response.authoritative() && none_indeterminate {
+            if response.authoritative && none_indeterminate {
                 let result = response.maybe_strip_dnssec_records(query_has_dnssec_ok);
                 #[cfg(feature = "metrics")]
                 self.metrics
@@ -494,7 +499,7 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
         // These need to bypass the cache lookup (and casting to a Lookup object in general)
         // to preserve SOA and DNSSEC records, and to keep those records in the authorities
         // section of the response.
-        if response.response_code() == ResponseCode::NXDomain {
+        if response.response_code == ResponseCode::NXDomain {
             use crate::recursor::RecursorError;
 
             let Err(dns_error) = DnsError::from_response(response) else {
@@ -504,9 +509,9 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
             };
 
             Err(RecursorError::Net(NetError::from(dns_error)))
-        } else if response.answers().is_empty()
-            && !response.authorities().is_empty()
-            && response.response_code() == ResponseCode::NoError
+        } else if response.answers.is_empty()
+            && !response.authorities.is_empty()
+            && response.response_code == ResponseCode::NoError
         {
             let mut no_records = NoRecords::new(query.clone(), ResponseCode::NoError);
             no_records.soa = response
@@ -515,7 +520,7 @@ impl<P: ConnectionProvider> ValidatingRecursor<P> {
                 .map(|record| Box::new(record.to_owned()));
             no_records.authorities = Some(
                 response
-                    .authorities()
+                    .authorities
                     .iter()
                     .filter_map(|x| match x.record_type() {
                         RecordType::SOA => None,
@@ -623,6 +628,12 @@ pub struct RecursorOptions {
     /// Configure RFC 9539 opportunistic encryption.
     #[cfg_attr(feature = "serde", serde(default))]
     pub opportunistic_encryption: OpportunisticEncryption,
+
+    /// Configure the EDNS UDP payload size used in queries.
+    ///
+    /// See [DnsRequestOptions::edns_payload_len][crate::proto::op::DnsRequestOptions::edns_payload_len].
+    #[cfg_attr(feature = "serde", serde(default = "default_edns_payload_len"))]
+    pub edns_payload_len: u16,
 }
 
 impl Default for RecursorOptions {
@@ -640,6 +651,7 @@ impl Default for RecursorOptions {
             cache_policy: TtlConfig::default(),
             case_randomization: false,
             opportunistic_encryption: OpportunisticEncryption::default(),
+            edns_payload_len: default_edns_payload_len(),
         }
     }
 }
@@ -667,6 +679,10 @@ fn ns_recursion_limit_default() -> u8 {
 #[cfg(feature = "serde")]
 fn deny_server_default() -> Vec<IpNet> {
     RECOMMENDED_SERVER_FILTERS.to_vec()
+}
+
+fn default_edns_payload_len() -> u16 {
+    DEFAULT_MAX_PAYLOAD_LEN
 }
 
 /// `Recursor`'s DNSSEC policy

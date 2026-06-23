@@ -7,6 +7,7 @@
 
 //! mail exchange, email, record
 
+use alloc::string::ToString;
 use core::fmt;
 
 #[cfg(feature = "serde")]
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::ProtoResult,
     rr::{RData, RecordData, RecordType, domain::Name},
-    serialize::binary::*,
+    serialize::{binary::*, txt::ParseError},
 };
 
 /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
@@ -37,9 +38,24 @@ use crate::{
 /// ```
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[non_exhaustive]
 pub struct MX {
-    preference: u16,
-    exchange: Name,
+    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
+    ///
+    /// ```text
+    /// PREFERENCE      A 16 bit integer which specifies the preference given to
+    ///                 this RR among others at the same owner.  Lower values
+    ///                 are preferred.
+    /// ```
+    pub preference: u16,
+
+    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
+    ///
+    /// ```text
+    /// EXCHANGE        A <domain-name> which specifies a host willing to act as
+    ///                 a mail exchange for the owner name.
+    /// ```
+    pub exchange: Name,
 }
 
 impl MX {
@@ -60,25 +76,21 @@ impl MX {
         }
     }
 
-    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
-    ///
-    /// ```text
-    /// PREFERENCE      A 16 bit integer which specifies the preference given to
-    ///                 this RR among others at the same owner.  Lower values
-    ///                 are preferred.
-    /// ```
-    pub fn preference(&self) -> u16 {
-        self.preference
-    }
+    /// Parse the RData from a set of Tokens
+    pub(crate) fn from_tokens<'i, I: Iterator<Item = &'i str>>(
+        mut tokens: I,
+        origin: Option<&Name>,
+    ) -> Result<Self, ParseError> {
+        let preference: u16 = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("preference".to_string()))
+            .and_then(|s| s.parse().map_err(Into::into))?;
+        let exchange: Name = tokens
+            .next()
+            .ok_or_else(|| ParseError::MissingToken("exchange".to_string()))
+            .and_then(|s| Name::parse(s, origin).map_err(ParseError::from))?;
 
-    /// [RFC 1035, DOMAIN NAMES - IMPLEMENTATION AND SPECIFICATION, November 1987](https://tools.ietf.org/html/rfc1035)
-    ///
-    /// ```text
-    /// EXCHANGE        A <domain-name> which specifies a host willing to act as
-    ///                 a mail exchange for the owner name.
-    /// ```
-    pub fn exchange(&self) -> &Name {
-        &self.exchange
+        Ok(Self::new(preference, exchange))
     }
 }
 
@@ -86,15 +98,15 @@ impl BinEncodable for MX {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         let mut encoder = encoder.with_rdata_behavior(RDataEncoding::StandardRecord);
 
-        encoder.emit_u16(self.preference())?;
-        self.exchange().emit(&mut encoder)?;
+        self.preference.emit(&mut encoder)?;
+        self.exchange.emit(&mut encoder)?;
 
         Ok(())
     }
 }
 
 impl<'r> BinDecodable<'r> for MX {
-    fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
+    fn read(decoder: &mut BinDecoder<'r>) -> Result<Self, DecodeError> {
         Ok(Self::new(
             decoder.read_u16()?.unverified(/*any u16 is valid*/),
             Name::read(decoder)?,

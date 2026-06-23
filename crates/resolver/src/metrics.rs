@@ -7,8 +7,12 @@
 
 //! Metrics related to resolver and recursive resolver operations
 
+use metrics::{
+    Counter, Gauge, Histogram, Unit, counter, describe_counter, describe_gauge, describe_histogram,
+    gauge, histogram,
+};
+
 use hickory_net::xfer::Protocol;
-use metrics::{Counter, Unit, counter, describe_counter};
 
 #[derive(Clone, Default)]
 pub(crate) struct ResolverMetrics {
@@ -77,8 +81,71 @@ impl Default for ProtocolMetrics {
     }
 }
 
+/// Metrics for the resolver's response cache.
+#[derive(Clone, Debug)]
+pub(crate) struct CacheMetrics {
+    pub(crate) cache_hit: Counter,
+    pub(crate) cache_miss: Counter,
+    pub(crate) cache_hit_duration: Histogram,
+    pub(crate) cache_miss_duration: Histogram,
+    pub(crate) cache_size: Gauge,
+}
+
+impl Default for CacheMetrics {
+    fn default() -> Self {
+        describe_counter!(
+            CACHE_HIT_TOTAL,
+            Unit::Count,
+            "Number of resolver requests answered from the cache."
+        );
+        describe_counter!(
+            CACHE_MISS_TOTAL,
+            Unit::Count,
+            "Number of resolver requests that could not be answered from the cache."
+        );
+        describe_histogram!(
+            CACHE_HIT_DURATION,
+            Unit::Seconds,
+            "Duration of resolver lookups answered from the cache."
+        );
+        describe_histogram!(
+            CACHE_MISS_DURATION,
+            Unit::Seconds,
+            "Duration of resolver lookups that could not be answered from the cache."
+        );
+        describe_gauge!(
+            RESPONSE_CACHE_SIZE,
+            Unit::Count,
+            "Number of entries in the resolver response cache."
+        );
+
+        Self {
+            cache_hit: counter!(CACHE_HIT_TOTAL),
+            cache_miss: counter!(CACHE_MISS_TOTAL),
+            cache_hit_duration: histogram!(CACHE_HIT_DURATION),
+            cache_miss_duration: histogram!(CACHE_MISS_DURATION),
+            cache_size: gauge!(RESPONSE_CACHE_SIZE),
+        }
+    }
+}
+
 /// Number of outgoing resolver queries by transport protocol.
 pub const OUTGOING_QUERIES_TOTAL: &str = "hickory_resolver_outgoing_queries_total";
+
+/// Number of resolver requests answered from the cache.
+pub const CACHE_HIT_TOTAL: &str = "hickory_resolver_cache_hit_total";
+
+/// Number of resolver requests that could not be answered from the cache.
+pub const CACHE_MISS_TOTAL: &str = "hickory_resolver_cache_miss_total";
+
+/// Duration of resolver lookups answered from the cache.
+pub const CACHE_HIT_DURATION: &str = "hickory_resolver_cache_hit_duration_seconds";
+
+/// Duration of resolver lookups that could not be answered from the cache.
+pub const CACHE_MISS_DURATION: &str = "hickory_resolver_cache_miss_duration_seconds";
+
+/// Number of entries in the resolver response cache.
+pub const RESPONSE_CACHE_SIZE: &str = "hickory_resolver_response_cache_size";
 
 /// Metrics for the optional recursive resolver feature
 #[cfg(feature = "recursor")]
@@ -136,7 +203,7 @@ pub mod recursor {
             let cache_hit_duration = histogram!(CACHE_HIT_DURATION);
             describe_histogram!(
                 CACHE_HIT_DURATION,
-                Unit::Milliseconds,
+                Unit::Seconds,
                 "Duration of recursive resolution for queries that are answered from cache."
             );
             let cache_miss_duration = histogram!(CACHE_MISS_DURATION);
@@ -219,9 +286,9 @@ pub mod recursor {
     impl DnssecRecursorMetrics {
         pub(crate) fn increment_proof_counter(&self, response: &Message) {
             match response
-                .answers()
+                .answers
                 .iter()
-                .map(|record| record.proof())
+                .map(|record| record.proof)
                 .min()
                 .unwrap_or(Proof::Indeterminate)
             {
@@ -309,7 +376,7 @@ pub mod recursor {
     pub const OUTGOING_QUERIES_TOTAL: &str = "hickory_recursor_outgoing_queries_total";
 
     /// Duration of recursive resolution for queries that are answered from cache.
-    pub const CACHE_HIT_DURATION: &str = "hickory_recursor_cache_hit_duration_milliseconds";
+    pub const CACHE_HIT_DURATION: &str = "hickory_recursor_cache_hit_duration_seconds";
 
     /// Duration of recursive resolution for queries that are not answered from cache.
     pub const CACHE_MISS_DURATION: &str = "hickory_recursor_cache_miss_duration_seconds";

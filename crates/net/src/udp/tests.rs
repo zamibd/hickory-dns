@@ -120,8 +120,8 @@ pub(super) async fn udp_client_stream_test(server_addr: IpAddr, provider: impl R
         |response| match response {
             Ok(response) => {
                 let response = Message::from(response);
-                if let RData::NULL(null) = response.answers()[0].data() {
-                    assert_eq!(null.anything(), b"DEADBEEF");
+                if let RData::NULL(null) = &response.answers[0].data {
+                    assert_eq!(null.anything, b"DEADBEEF");
                     true
                 } else {
                     panic!("not a NULL response");
@@ -148,12 +148,13 @@ pub(super) async fn udp_client_stream_bad_id_test(
         |idx, message| {
             // Mutate the first response to have the wrong ID
             if idx == 0 {
-                message.set_id(message.id().wrapping_add(1));
+                message.metadata.id = message.id.wrapping_add(1);
             }
         },
         |response| {
-            // The test should pass when we see a bad transaction ID response error.
-            matches!(response, Err(NetError::BadTransactionId))
+            // The test should pass when we see a timeout after waiting for a response
+            // with a correct transaction ID
+            matches!(response, Err(NetError::Timeout))
         },
     )
     .await;
@@ -176,8 +177,8 @@ pub(super) async fn udp_client_stream_response_limit_test(
             // We should skip through reading the first three responses, and then error
             // before looking at the fourth correct response.
             if idx < 3 {
-                message.queries_mut().clear();
-                message.add_query(Query::query(
+                message.queries.clear();
+                message.add_query(Query::new(
                     Name::from_str("wrong.name.").unwrap(),
                     RecordType::A,
                 ));
@@ -216,9 +217,14 @@ async fn udp_client_stream_test_inner(
 
     let mut query = Message::query();
     let query_name = Name::from_str("dead.beef.").unwrap();
-    query.add_query(Query::query(query_name.clone(), RecordType::NULL));
+    query.add_query(Query::new(query_name.clone(), RecordType::NULL));
     let test_bytes: &'static [u8; 8] = b"DEADBEEF";
 
+    // Keep the server socket alive until the client is done, so that retry
+    // attempts don't hit a closed port. On Windows, sending UDP to a closed
+    // port triggers ICMP "port unreachable" which causes `recv_from()` to return
+    // a connection reset error instead of blocking until timeout.
+    let server_done = stop_thread_killer.clone();
     let test_name_server = query_name;
     let server_handle = thread::Builder::new()
         .name(format!("{test_name}:server"))
@@ -232,13 +238,11 @@ async fn udp_client_stream_test_inner(
                 debug!("server received request {} from: {}", i, addr);
 
                 let request = Message::from_vec(&buffer[0..len]).expect("failed parse of request");
-                assert_eq!(*request.queries()[0].name(), test_name_server.clone());
-                assert_eq!(request.queries()[0].query_type(), RecordType::NULL);
+                assert_eq!(request.queries[0].name, test_name_server.clone());
+                assert_eq!(request.queries[0].query_type, RecordType::NULL);
 
                 for response_idx in 0..response_count {
-                    let mut message = Message::query();
-                    message.set_id(request.id());
-                    message.add_queries(request.queries().to_vec());
+                    let mut message = request.clone().into_response();
                     message.add_answer(Record::from_rdata(
                         test_name_server.clone(),
                         0,
@@ -253,6 +257,10 @@ async fn udp_client_stream_test_inner(
                     debug!("server sent response {response_idx} for request {i}");
                 }
                 thread::yield_now();
+            }
+
+            while !server_done.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
             }
         })
         .unwrap();

@@ -14,11 +14,12 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ProtoError,
     dnssec::{Algorithm, DigestType},
     error::ProtoResult,
     rr::{RData, RecordData, RecordDataDecodable, RecordType},
-    serialize::binary::{BinDecoder, BinEncodable, BinEncoder, Restrict, RestrictedMath},
+    serialize::binary::{
+        BinDecoder, BinEncodable, BinEncoder, DecodeError, Restrict, RestrictedMath,
+    },
 };
 
 use super::DNSSECRData;
@@ -97,20 +98,18 @@ impl From<CDS> for RData {
 
 impl BinEncodable for CDS {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16(self.key_tag())?;
+        self.key_tag().emit(encoder)?;
         match self.algorithm() {
             Some(algorithm) => algorithm.emit(encoder)?,
-            None => encoder.emit_u8(0)?,
+            None => 0u8.emit(encoder)?,
         }
-        encoder.emit(self.digest_type().into())?;
-        encoder.emit_vec(self.digest())?;
-
-        Ok(())
+        u8::from(self.digest_type()).emit(encoder)?;
+        encoder.emit_slice(self.digest())
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for CDS {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<Self> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         let start_idx = decoder.index();
 
         let key_tag = decoder.read_u16()?.unverified(/* any u16 is a valid key_tag */);
@@ -128,7 +127,7 @@ impl<'r> RecordDataDecodable<'r> for CDS {
         let left = length
             .map(|u| u as usize)
             .checked_sub(bytes_read)
-            .map_err(|_| ProtoError::from("invalid rdata length in CDS"))?
+            .map_err(|len| DecodeError::IncorrectRDataLengthRead { read: bytes_read, len })?
             .unverified(/* used only as length safely */);
         let digest =
             decoder.read_vec(left)?.unverified(/* this is only compared with other digests */);

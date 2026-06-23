@@ -14,7 +14,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::lock::{Mutex as AsyncMutex, MutexGuard};
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, once};
@@ -26,7 +26,9 @@ use parking_lot::Mutex;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use tracing::{debug, error, info};
+#[cfg(all(feature = "toml", any(feature = "__tls", feature = "__quic")))]
+use tracing::info;
+use tracing::{debug, error};
 
 #[cfg(any(feature = "__tls", feature = "__quic"))]
 use crate::config::OpportunisticEncryptionConfig;
@@ -131,7 +133,7 @@ impl<P: ConnectionProvider> NameServerPool<P> {
 
 // Type alias for TTL unit tests to use tokio's time pause/advance
 #[cfg(not(feature = "tokio"))]
-type TtlInstant = std::time::Instant;
+type TtlInstant = Instant;
 #[cfg(feature = "tokio")]
 type TtlInstant = tokio::time::Instant;
 
@@ -140,7 +142,7 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
     type Runtime = P::RuntimeProvider;
 
     fn lookup(&self, query: Query, mut options: DnsRequestOptions) -> Self::Response {
-        debug!("querying: {} {:?}", query.name(), query.query_type());
+        debug!("querying: {} {:?}", query.name, query.query_type);
         options.case_randomization = self.state.cx.options.case_randomization;
         self.send(DnsRequest::from_query(query, options))
     }
@@ -151,21 +153,21 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
         let active_requests = self.active_requests.clone();
 
         Box::pin(once(async move {
-            debug!("sending request: {:?}", request.queries());
-            let query = match request.queries().first() {
+            debug!("sending request: {:?}", request.queries);
+            let query = match request.queries.first() {
                 Some(q) => q.clone(),
                 None => return Err("no query in request".into()),
             };
 
             let key = Arc::new(CacheKey::from_request(&request));
 
-            let lookup = {
+            let (lookup, is_creator) = {
                 let mut active = active_requests.lock();
                 if let Some(existing) = active.get(&key) {
                     debug!(%query, "query currently in progress - returning shared lookup");
-                    existing.clone()
+                    (existing.clone(), false)
                 } else {
-                    info!(%query, "creating new shared lookup");
+                    debug!(%query, "creating new shared lookup");
 
                     let lookup = async move {
                         match state.try_send(request).await {
@@ -178,22 +180,29 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
 
                     let shared_lookup = SharedLookup(lookup);
                     active.insert(key.clone(), shared_lookup.clone());
-                    shared_lookup
+                    (shared_lookup, true)
                 }
             };
 
-            let response = lookup.await;
+            // Only the creator removes the key so that the entry is not
+            // removed prematurely by a waiter task.  Using a guard ensures
+            // the entry is removed even if `lookup.await` panics, which
+            // would otherwise leave a poisoned `SharedLookup` in the map and
+            // cause every subsequent request for the same key to also panic.
+            let _cleanup = is_creator.then(|| ActiveRequestCleanup {
+                active_requests: active_requests.clone(),
+                key: key.clone(),
+            });
 
-            // remove the concurrent request marker
-            active_requests.lock().remove(&key);
+            let response = lookup.await;
             let mut response = response?;
 
-            let Some(acs) = acs else {
+            if acs.allows_all() {
                 return Ok(response);
-            };
+            }
 
             let answer_filter = |record: &Record| {
-                let ip = match record.data() {
+                let ip = match &record.data {
                     RData::A(A(ipv4)) => (*ipv4).into(),
                     RData::AAAA(AAAA(ipv6)) => (*ipv6).into(),
                     _ => return true,
@@ -212,16 +221,16 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
                 }
             };
 
-            let answers_len = response.answers().len();
-            let authorities_len = response.authorities().len();
+            let answers_len = response.answers.len();
+            let authorities_len = response.authorities.len();
 
-            response.additionals_mut().retain(answer_filter);
-            response.answers_mut().retain(answer_filter);
-            response.authorities_mut().retain(answer_filter);
+            response.additionals.retain(answer_filter);
+            response.answers.retain(answer_filter);
+            response.authorities.retain(answer_filter);
 
-            if response.answers().is_empty() && answers_len != 0
-                || (response.answers().is_empty()
-                    && response.authorities().is_empty()
+            if response.answers.is_empty() && answers_len != 0
+                || (response.answers.is_empty()
+                    && response.authorities.is_empty()
                     && authorities_len != 0)
             {
                 return Err(NoRecords::new(Box::new(query.clone()), ResponseCode::NXDomain).into());
@@ -248,7 +257,7 @@ impl<P: ConnectionProvider> PoolState<P> {
             //   reorder the connections based on current view...
             //   this reorders the inner set
             ServerOrderingStrategy::QueryStatistics => {
-                servers.sort_by(|a, b| a.decayed_srtt().total_cmp(&b.decayed_srtt()));
+                sort_servers_by_query_statistics(&mut servers);
             }
             ServerOrderingStrategy::UserProvidedOrder => {}
             ServerOrderingStrategy::RoundRobin => {
@@ -274,9 +283,12 @@ impl<P: ConnectionProvider> PoolState<P> {
         // the backoff increases exponentially (by a factor of 2), until it hits 300ms, in which case we
         // give up. The request might still be retried by the caller (likely the DnsRetryHandle).
         //
-        // TODO: more principled handling of timeouts. Currently, timeouts appear to be handled mostly
-        // close to the connection, which means the top level resolution might take substantially longer
-        // to fire than the timeout configured in `ResolverOpts`.
+        // Enforce an end-to-end deadline so the total time spent in this loop never exceeds the
+        // configured timeout.  Without this, the pool can spend up to N × timeout (where N is the
+        // number of servers) before returning an error — well past the point where clients have
+        // given up and retransmitted the query.
+        let deadline = Instant::now() + self.cx.options.timeout;
+
         let mut servers = VecDeque::from(servers);
         let mut backoff = Duration::from_millis(20);
         let mut busy = SmallVec::<[Arc<NameServer<P>>; 2]>::new();
@@ -284,6 +296,11 @@ impl<P: ConnectionProvider> PoolState<P> {
         let mut policy = ConnectionPolicy::default();
 
         loop {
+            // Check the deadline before starting a new round of server attempts.
+            if Instant::now() >= deadline {
+                return Err(NetError::Timeout);
+            }
+
             // construct the parallel requests, 2 is the default
             let mut par_servers = SmallVec::<[_; 2]>::new();
             while !servers.is_empty()
@@ -298,8 +315,13 @@ impl<P: ConnectionProvider> PoolState<P> {
 
             if par_servers.is_empty() {
                 if !busy.is_empty() && backoff < Duration::from_millis(300) {
+                    // Cap the backoff sleep so we don't sleep past the deadline.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(NetError::Timeout);
+                    }
                     <<P as ConnectionProvider>::RuntimeProvider as RuntimeProvider>::Timer::delay_for(
-                        backoff,
+                        backoff.min(remaining),
                     ).await;
                     servers.extend(busy.drain(..).filter(|ns| policy.allows_server(ns)));
                     backoff *= 2;
@@ -308,6 +330,11 @@ impl<P: ConnectionProvider> PoolState<P> {
                 return Err(err);
             }
 
+            // Track all servers in the parallel batch so we can penalize any
+            // that are still in-flight when a winner is found.
+            let in_flight = par_servers.iter().cloned().collect::<SmallVec<[_; 2]>>();
+
+            let batch_start = Instant::now();
             let mut requests = par_servers
                 .into_iter()
                 .map(|server| {
@@ -324,16 +351,31 @@ impl<P: ConnectionProvider> PoolState<P> {
                 })
                 .collect::<FuturesUnordered<_>>();
 
+            // Servers that have already completed (successfully or with an
+            // error) — used to avoid double-penalizing them.
+            let mut completed = SmallVec::<[IpAddr; 2]>::new();
+
             while let Some((server, result)) = requests.next().await {
+                completed.push(server.ip());
                 let e = match result {
-                    Ok(response) if response.truncated() => {
+                    Ok(response) if response.truncation => {
                         debug!("truncated response received, retrying over TCP");
                         policy.disable_udp = true;
                         err = NetError::from("received truncated response");
                         servers.push_front(server);
                         continue;
                     }
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        // Penalize servers still in-flight (see `record_cancelled`).
+                        let winner_rtt = batch_start.elapsed();
+                        for abandoned in &in_flight {
+                            if !completed.contains(&abandoned.ip()) {
+                                debug!(ip = ?abandoned.ip(), ?winner_rtt, "recording cancelled parallel server");
+                                abandoned.record_cancelled(winner_rtt);
+                            }
+                        }
+                        return Ok(response);
+                    }
                     Err(e) => e,
                 };
 
@@ -347,8 +389,8 @@ impl<P: ConnectionProvider> PoolState<P> {
                     }
                     // If the server is busy, try it again later if necessary.
                     NetError::Busy => busy.push(server),
-                    // If the connection failed, try another one.
-                    NetError::Io(_) | NetError::NoConnections => {}
+                    // If the connection failed or timed out, try another one.
+                    NetError::Io(_) | NetError::NoConnections | NetError::Timeout => {}
                     // If we got an `NXDomain` response from a server whose negative responses we
                     // don't trust, we should try another server.
                     NetError::Dns(DnsError::NoRecordsFound(NoRecords {
@@ -393,6 +435,20 @@ fn most_specific(previous: NetError, current: NetError) -> NetError {
     previous
 }
 
+/// Sorts servers by their decayed SRTT for query-statistics-based ordering.
+///
+/// Uses `sort_by_cached_key` to evaluate each server's decayed SRTT exactly
+/// once. This is critical because `decayed_srtt()` reads shared mutable state
+/// that can change between calls due to concurrent query completions, which
+/// would violate the total-order invariant required by `sort_by`.
+pub(crate) fn sort_servers_by_query_statistics<P: ConnectionProvider>(
+    servers: &mut [Arc<NameServer<P>>],
+) {
+    // Positive f64 bit patterns sort in the same order as their float values,
+    // so to_bits() is a valid u64 ordering key for non-negative SRTT values.
+    servers.sort_by_cached_key(|s| s.decayed_srtt().to_bits());
+}
+
 /// Context for a [`NameServerPool`]
 #[non_exhaustive]
 pub struct PoolContext {
@@ -408,7 +464,7 @@ pub struct PoolContext {
     /// Opportunistic encryption name server transport state
     pub transport_state: AsyncMutex<NameServerTransportState>,
     /// Answer address filter
-    pub answer_address_filter: Option<AccessControlSet>,
+    pub answer_address_filter: AccessControlSet,
 }
 
 impl PoolContext {
@@ -435,7 +491,7 @@ impl PoolContext {
 
     /// Add an answer address filter
     pub fn with_answer_filter(mut self, answer_filter: AccessControlSet) -> Self {
-        self.answer_address_filter = Some(answer_filter);
+        self.answer_address_filter = answer_filter;
         self
     }
 
@@ -844,6 +900,23 @@ mod opportunistic_encryption_persistence {
     }
 }
 
+/// RAII guard that removes a deduplication key from `active_requests` when dropped.
+///
+/// This is created only by the "creator" task (the one that inserted the key).
+/// Using `Drop` guarantees the entry is removed even if the inner future panics,
+/// preventing a poisoned [`SharedLookup`] from remaining in the map and causing
+/// every subsequent request for the same key to also panic.
+struct ActiveRequestCleanup {
+    active_requests: Arc<Mutex<HashMap<Arc<CacheKey>, SharedLookup>>>,
+    key: Arc<CacheKey>,
+}
+
+impl Drop for ActiveRequestCleanup {
+    fn drop(&mut self) {
+        self.active_requests.lock().remove(&self.key);
+    }
+}
+
 /// Fields of a [`DnsRequest`] that are used as a key when memoizing queries.
 #[derive(PartialEq, Eq, Hash)]
 struct CacheKey {
@@ -859,7 +932,7 @@ impl CacheKey {
     fn from_request(request: &DnsRequest) -> Self {
         let dnssec_ok;
         let client_subnet;
-        if let Some(edns) = request.extensions() {
+        if let Some(edns) = &request.edns {
             dnssec_ok = edns.flags().dnssec_ok;
             if let Some(EdnsOption::Subnet(subnet)) = edns.option(EdnsCode::Subnet) {
                 client_subnet = Some(*subnet);
@@ -871,10 +944,10 @@ impl CacheKey {
             client_subnet = None;
         }
         Self {
-            op_code: request.op_code(),
-            recursion_desired: request.recursion_desired(),
-            checking_disabled: request.checking_disabled(),
-            queries: request.queries().to_vec(),
+            op_code: request.op_code,
+            recursion_desired: request.recursion_desired,
+            checking_disabled: request.checking_disabled,
+            queries: request.queries.clone(),
             dnssec_ok,
             client_subnet,
         }
@@ -898,14 +971,25 @@ impl Future for SharedLookup {
 #[cfg(test)]
 #[cfg(feature = "tokio")]
 mod tests {
-    use std::{net::IpAddr, str::FromStr};
+    use std::collections::HashSet;
+    use std::future::Future;
+    use std::io;
+    use std::net::{IpAddr, SocketAddr};
+    use std::pin::Pin;
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
-    use test_support::subscribe;
+    use futures_util::future;
+    use test_support::{
+        MockNetworkHandler, MockProvider, MockRecord, MockTcpStream, MockUdpSocket, subscribe,
+    };
     use tokio::runtime::Runtime;
 
     use super::*;
-    use crate::config::{NameServerConfig, ResolverConfig};
-    use crate::net::runtime::TokioRuntimeProvider;
+    use crate::config::{NameServerConfig, ResolverConfig, ServerOrderingStrategy};
+    use crate::net::runtime::{RuntimeProvider, TokioHandle, TokioRuntimeProvider, TokioTime};
     use crate::net::xfer::{DnsHandle, FirstAnswer};
     use crate::proto::op::{DnsRequestOptions, Query};
     use crate::proto::rr::{Name, RecordType};
@@ -921,9 +1005,7 @@ mod tests {
         config1.trust_negative_responses = false;
         let config2 = NameServerConfig::udp(IpAddr::from([8, 8, 8, 8]));
 
-        let mut resolver_config = ResolverConfig::default();
-        resolver_config.add_name_server(config1);
-        resolver_config.add_name_server(config2);
+        let resolver_config = ResolverConfig::from_name_servers(vec![config1, config2]);
 
         let io_loop = Runtime::new().unwrap();
         let pool = NameServerPool::from_config(
@@ -943,7 +1025,7 @@ mod tests {
                 io_loop
                     .block_on(
                         pool.lookup(
-                            Query::query(name.clone(), RecordType::A),
+                            Query::new(name.clone(), RecordType::A),
                             DnsRequestOptions::default()
                         )
                         .first_answer()
@@ -959,7 +1041,7 @@ mod tests {
                 io_loop
                     .block_on(
                         pool.lookup(
-                            Query::query(name.clone(), RecordType::A),
+                            Query::new(name.clone(), RecordType::A),
                             DnsRequestOptions::default()
                         )
                         .first_answer()
@@ -994,14 +1076,14 @@ mod tests {
         // first lookup
         let response = pool
             .lookup(
-                Query::query(name.clone(), RecordType::A),
+                Query::new(name.clone(), RecordType::A),
                 DnsRequestOptions::default(),
             )
             .first_answer()
             .await
             .expect("lookup failed");
 
-        assert!(!response.answers().is_empty());
+        assert!(!response.answers.is_empty());
 
         assert!(
             name_servers[0].is_connected(),
@@ -1011,18 +1093,547 @@ mod tests {
         // first lookup
         let response = pool
             .lookup(
-                Query::query(name, RecordType::AAAA),
+                Query::new(name, RecordType::AAAA),
                 DnsRequestOptions::default(),
             )
             .first_answer()
             .await
             .expect("lookup failed");
 
-        assert!(!response.answers().is_empty());
+        assert!(!response.answers.is_empty());
 
         assert!(
             name_servers[0].is_connected(),
             "if this is failing then the NameServers aren't being properly shared."
         );
+    }
+
+    /// Regression test: when the first name server in the pool times out, the pool should
+    /// try the remaining servers rather than returning the timeout error immediately.
+    ///
+    /// Before the fix (adding `NetError::Timeout` to the retry match arm in `try_send`),
+    /// a timeout from one server would cause the entire lookup to fail even when other
+    /// servers in the pool could have answered successfully.
+    #[tokio::test]
+    async fn test_pool_retries_on_timeout() {
+        subscribe();
+
+        let timeout_ip = IpAddr::from([10, 0, 0, 1]);
+        let good_ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        // Set up a mock handler where the good server returns a valid A record.
+        let responses = vec![MockRecord::a(good_ip, &query_name, good_ip)];
+        let handler = MockNetworkHandler::new(responses);
+        let mock_provider = MockProvider::new(handler);
+
+        // Wrap in TimeoutProvider so that the timeout_ip always fails with TimedOut.
+        let provider = TimeoutProvider::new(mock_provider, vec![timeout_ip]);
+
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 1,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+
+        let pool = NameServerPool::from_nameservers(
+            vec![
+                Arc::new(NameServer::new(
+                    [].into_iter(),
+                    NameServerConfig::udp(timeout_ip),
+                    &opts,
+                    provider.clone(),
+                )),
+                Arc::new(NameServer::new(
+                    [].into_iter(),
+                    NameServerConfig::udp(good_ip),
+                    &opts,
+                    provider.clone(),
+                )),
+            ],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        // This should succeed: the pool should fall through the timeout from the first
+        // server and get the answer from the second server.
+        let response = pool
+            .lookup(
+                Query::new(query_name.clone(), RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer()
+            .await
+            .expect("pool should retry on timeout and succeed with the second server");
+
+        assert!(
+            !response.answers.is_empty(),
+            "expected A record in response"
+        );
+    }
+
+    /// Regression test: when a server times out, its server-level SRTT should be penalized
+    /// so that it gets deprioritized in future pool ordering.
+    #[tokio::test]
+    async fn test_timeout_penalizes_server_srtt() {
+        subscribe();
+
+        let timeout_ip = IpAddr::from([10, 0, 0, 1]);
+        let good_ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        let responses = vec![MockRecord::a(good_ip, &query_name, good_ip)];
+        let handler = MockNetworkHandler::new(responses);
+        let mock_provider = MockProvider::new(handler);
+        let provider = TimeoutProvider::new(mock_provider, vec![timeout_ip]);
+
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 1,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+
+        let ns_timeout = Arc::new(NameServer::new(
+            [].into_iter(),
+            NameServerConfig::udp(timeout_ip),
+            &opts,
+            provider.clone(),
+        ));
+        let ns_good = Arc::new(NameServer::new(
+            [].into_iter(),
+            NameServerConfig::udp(good_ip),
+            &opts,
+            provider.clone(),
+        ));
+
+        let initial_srtt_timeout = ns_timeout.decayed_srtt();
+
+        let pool = NameServerPool::from_nameservers(
+            vec![ns_timeout.clone(), ns_good.clone()],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        // Perform a lookup - the first server will timeout, second will succeed.
+        let _response = pool
+            .lookup(
+                Query::new(query_name.clone(), RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer()
+            .await
+            .expect("lookup should succeed via second server");
+
+        // The timeout server's SRTT should have been penalized (increased).
+        assert!(
+            ns_timeout.decayed_srtt() > initial_srtt_timeout,
+            "timeout server SRTT should increase after failure: {} should be > {}",
+            ns_timeout.decayed_srtt(),
+            initial_srtt_timeout,
+        );
+
+        // The good server's SRTT should not have been penalized.
+        // It may have changed slightly due to recording a successful RTT, but should
+        // not have jumped to the failure penalty value.
+        let failure_penalty = 5_000_000.0_f64; // SRTT failure penalty
+        assert!(
+            ns_good.decayed_srtt() < failure_penalty,
+            "good server SRTT should not be penalized: {}",
+            ns_good.decayed_srtt(),
+        );
+    }
+
+    /// A [`RuntimeProvider`] wrapper that returns `io::ErrorKind::TimedOut` from `bind_udp`
+    /// for a specified set of server IPs, simulating a connection-level timeout. All other
+    /// IPs are delegated to the inner provider.
+    #[derive(Clone)]
+    struct TimeoutProvider {
+        inner: MockProvider,
+        timeout_ips: Arc<HashSet<IpAddr>>,
+    }
+
+    impl TimeoutProvider {
+        fn new(inner: MockProvider, timeout_ips: Vec<IpAddr>) -> Self {
+            Self {
+                inner,
+                timeout_ips: Arc::new(timeout_ips.into_iter().collect()),
+            }
+        }
+    }
+
+    impl RuntimeProvider for TimeoutProvider {
+        type Handle = TokioHandle;
+        type Timer = TokioTime;
+        type Udp = MockUdpSocket;
+        type Tcp = MockTcpStream;
+
+        fn create_handle(&self) -> Self::Handle {
+            self.inner.create_handle()
+        }
+
+        fn connect_tcp(
+            &self,
+            server_addr: SocketAddr,
+            bind_addr: Option<SocketAddr>,
+            timeout: Option<Duration>,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Tcp, io::Error>> + Send>> {
+            if self.timeout_ips.contains(&server_addr.ip()) {
+                Box::pin(future::ready(Err(io::Error::from(io::ErrorKind::TimedOut))))
+            } else {
+                self.inner.connect_tcp(server_addr, bind_addr, timeout)
+            }
+        }
+
+        fn bind_udp(
+            &self,
+            local_addr: SocketAddr,
+            server_addr: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Udp, io::Error>> + Send>> {
+            if self.timeout_ips.contains(&server_addr.ip()) {
+                Box::pin(future::ready(Err(io::Error::from(io::ErrorKind::TimedOut))))
+            } else {
+                self.inner.bind_udp(local_addr, server_addr)
+            }
+        }
+    }
+
+    /// Regression test: an unreachable server racing in parallel must be penalized.
+    ///
+    /// When `num_concurrent_reqs >= 2`, multiple servers are queried in parallel
+    /// via `FuturesUnordered`. If a reachable server responds first, the
+    /// unreachable server's future is dropped (cancelled). Before the fix, this
+    /// meant `record_failure()` was never called for the unreachable server,
+    /// leaving its SRTT unchanged so it would be retried on every subsequent
+    /// query.
+    #[tokio::test]
+    async fn test_cancelled_parallel_server_is_penalized() {
+        subscribe();
+
+        let unreachable_ip = IpAddr::from([10, 0, 0, 1]);
+        let good_ip = IpAddr::from([10, 0, 0, 2]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        let responses = vec![MockRecord::a(good_ip, &query_name, good_ip)];
+        let handler = MockNetworkHandler::new(responses);
+        let mock_provider = MockProvider::new(handler);
+        let provider = PendingProvider::new(mock_provider, vec![unreachable_ip]);
+
+        let opts = ResolverOpts {
+            // Both servers are queried in parallel — the key condition for this bug.
+            num_concurrent_reqs: 2,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+
+        let ns_unreachable = Arc::new(NameServer::new(
+            [].into_iter(),
+            NameServerConfig::udp(unreachable_ip),
+            &opts,
+            provider.clone(),
+        ));
+        let ns_good = Arc::new(NameServer::new(
+            [].into_iter(),
+            NameServerConfig::udp(good_ip),
+            &opts,
+            provider.clone(),
+        ));
+
+        let initial_srtt = ns_unreachable.decayed_srtt();
+
+        let pool = NameServerPool::from_nameservers(
+            vec![ns_unreachable.clone(), ns_good.clone()],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        // The good server wins the race; the unreachable server's future is cancelled.
+        let _response = pool
+            .lookup(
+                Query::new(query_name.clone(), RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer()
+            .await
+            .expect("lookup should succeed via good server");
+
+        // The unreachable server's SRTT must have increased despite its future
+        // being cancelled (not completing with an error).
+        assert!(
+            ns_unreachable.decayed_srtt() > initial_srtt,
+            "unreachable server SRTT should increase after being cancelled: {} should be > {}",
+            ns_unreachable.decayed_srtt(),
+            initial_srtt,
+        );
+
+        // The good server should not have been penalized.
+        let failure_penalty = 5_000_000.0_f64;
+        assert!(
+            ns_good.decayed_srtt() < failure_penalty,
+            "good server SRTT should not be penalized: {}",
+            ns_good.decayed_srtt(),
+        );
+    }
+
+    /// A [`RuntimeProvider`] wrapper where specified IPs never complete their
+    /// connection — the future stays pending forever. This simulates an
+    /// unreachable server (SYN sent, no SYN-ACK) where the OS TCP handshake
+    /// hasn't timed out yet.
+    #[derive(Clone)]
+    struct PendingProvider {
+        inner: MockProvider,
+        pending_ips: Arc<HashSet<IpAddr>>,
+    }
+
+    impl PendingProvider {
+        fn new(inner: MockProvider, pending_ips: Vec<IpAddr>) -> Self {
+            Self {
+                inner,
+                pending_ips: Arc::new(pending_ips.into_iter().collect()),
+            }
+        }
+    }
+
+    impl RuntimeProvider for PendingProvider {
+        type Handle = TokioHandle;
+        type Timer = TokioTime;
+        type Udp = MockUdpSocket;
+        type Tcp = MockTcpStream;
+
+        fn create_handle(&self) -> Self::Handle {
+            self.inner.create_handle()
+        }
+
+        fn connect_tcp(
+            &self,
+            server_addr: SocketAddr,
+            bind_addr: Option<SocketAddr>,
+            timeout: Option<Duration>,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Tcp, io::Error>> + Send>> {
+            if self.pending_ips.contains(&server_addr.ip()) {
+                Box::pin(future::pending())
+            } else {
+                self.inner.connect_tcp(server_addr, bind_addr, timeout)
+            }
+        }
+
+        fn bind_udp(
+            &self,
+            local_addr: SocketAddr,
+            server_addr: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Udp, io::Error>> + Send>> {
+            if self.pending_ips.contains(&server_addr.ip()) {
+                Box::pin(future::pending())
+            } else {
+                self.inner.bind_udp(local_addr, server_addr)
+            }
+        }
+    }
+
+    /// Regression test: when the top-ranked servers are unreachable and block for the
+    /// connect timeout duration, the pool must still have enough deadline budget remaining
+    /// to try additional servers.
+    ///
+    /// With `connect_timeout` defaulting to 2s, a batch of slow-to-fail servers consumes
+    /// at most 2s of the 5s deadline, leaving 3s for the remaining servers.
+    #[tokio::test]
+    async fn test_connect_timeout_leaves_budget_for_remaining_servers() {
+        subscribe();
+
+        let slow_ip_1 = IpAddr::from([10, 0, 0, 1]);
+        let slow_ip_2 = IpAddr::from([10, 0, 0, 2]);
+        let good_ip = IpAddr::from([10, 0, 0, 3]);
+        let query_name = Name::from_str("example.com.").unwrap();
+
+        let responses = vec![MockRecord::a(good_ip, &query_name, good_ip)];
+        let handler = MockNetworkHandler::new(responses);
+        let mock_provider = MockProvider::new(handler);
+
+        // The slow IPs will delay for 1.5s before returning TimedOut.
+        // With num_concurrent_reqs=2, both slow servers are tried in the first batch.
+        // With connect_timeout = 2s (default) and pool deadline = 5s,
+        // the slow servers consume ~1.5s, leaving ~3.5s for the good server.
+        let provider = SlowTimeoutProvider::new(
+            mock_provider,
+            vec![slow_ip_1, slow_ip_2],
+            Duration::from_millis(1500),
+        );
+
+        let opts = ResolverOpts {
+            num_concurrent_reqs: 2,
+            server_ordering_strategy: ServerOrderingStrategy::UserProvidedOrder,
+            ..ResolverOpts::default()
+        };
+
+        let pool = NameServerPool::from_nameservers(
+            vec![
+                Arc::new(NameServer::new(
+                    [].into_iter(),
+                    NameServerConfig::udp(slow_ip_1),
+                    &opts,
+                    provider.clone(),
+                )),
+                Arc::new(NameServer::new(
+                    [].into_iter(),
+                    NameServerConfig::udp(slow_ip_2),
+                    &opts,
+                    provider.clone(),
+                )),
+                Arc::new(NameServer::new(
+                    [].into_iter(),
+                    NameServerConfig::udp(good_ip),
+                    &opts,
+                    provider.clone(),
+                )),
+            ],
+            Arc::new(PoolContext::new(opts, TlsConfig::new().unwrap())),
+        );
+
+        let start = Instant::now();
+        let response = pool
+            .lookup(
+                Query::new(query_name.clone(), RecordType::A),
+                DnsRequestOptions::default(),
+            )
+            .first_answer()
+            .await
+            .expect("pool should fall through slow servers and reach the good server");
+
+        let elapsed = start.elapsed();
+
+        assert!(
+            !response.answers.is_empty(),
+            "expected A record in response"
+        );
+
+        // The lookup should complete well within the 5s deadline.
+        // It should take ~1.5s (slow batch) + a small amount for the good server.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "lookup took {elapsed:?}, which suggests the pool didn't fall through in time"
+        );
+    }
+
+    /// A [`RuntimeProvider`] wrapper where specified IPs delay for a configured duration
+    /// before returning `io::ErrorKind::TimedOut`. This simulates a SYN-drop scenario
+    /// where the TCP connect blocks until the connect timeout fires.
+    #[derive(Clone)]
+    struct SlowTimeoutProvider {
+        inner: MockProvider,
+        slow_ips: Arc<HashSet<IpAddr>>,
+        delay: Duration,
+    }
+
+    impl SlowTimeoutProvider {
+        fn new(inner: MockProvider, slow_ips: Vec<IpAddr>, delay: Duration) -> Self {
+            Self {
+                inner,
+                slow_ips: Arc::new(slow_ips.into_iter().collect()),
+                delay,
+            }
+        }
+    }
+
+    impl RuntimeProvider for SlowTimeoutProvider {
+        type Handle = TokioHandle;
+        type Timer = TokioTime;
+        type Udp = MockUdpSocket;
+        type Tcp = MockTcpStream;
+
+        fn create_handle(&self) -> Self::Handle {
+            self.inner.create_handle()
+        }
+
+        fn connect_tcp(
+            &self,
+            server_addr: SocketAddr,
+            bind_addr: Option<SocketAddr>,
+            timeout: Option<Duration>,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Tcp, io::Error>> + Send>> {
+            if self.slow_ips.contains(&server_addr.ip()) {
+                let delay = self.delay;
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                })
+            } else {
+                self.inner.connect_tcp(server_addr, bind_addr, timeout)
+            }
+        }
+
+        fn bind_udp(
+            &self,
+            local_addr: SocketAddr,
+            server_addr: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Udp, io::Error>> + Send>> {
+            if self.slow_ips.contains(&server_addr.ip()) {
+                let delay = self.delay;
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                })
+            } else {
+                self.inner.bind_udp(local_addr, server_addr)
+            }
+        }
+    }
+
+    /// Regression test: `sort_servers_by_query_statistics` must not panic when
+    /// SRTT values are concurrently modified.
+    ///
+    /// `record()` and `record_failure()` can modify a server's SRTT while
+    /// another thread sorts the server list. With `sort_by`, the comparator
+    /// re-evaluates `decayed_srtt()` on every comparison, observing values
+    /// that change between calls and violating the total-order invariant.
+    /// The fix uses `sort_by_cached_key`, which evaluates each key exactly
+    /// once before sorting.
+    #[test]
+    fn test_sort_by_decayed_srtt_does_not_panic() {
+        let opts = ResolverOpts::default();
+        let mock_provider = MockProvider::new(MockNetworkHandler::new(vec![]));
+
+        let mut servers = (1..=50)
+            .map(|i| {
+                let ns = Arc::new(NameServer::new(
+                    [],
+                    NameServerConfig::udp(IpAddr::from([10, 0, 0, i])),
+                    &opts,
+                    mock_provider.clone(),
+                ));
+                // Activate the time-based decay path by recording a failure,
+                // which sets `last_update` to `Some(now)`.
+                ns.test_record_failure();
+                ns
+            })
+            .collect::<Vec<_>>();
+
+        // Spawn a thread that continuously modifies SRTT values, simulating
+        // concurrent queries completing on other threads.
+        let servers_writer = servers.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = stop.clone();
+        let writer = thread::spawn(move || {
+            while !stop_writer.load(Ordering::Relaxed) {
+                for s in &servers_writer {
+                    s.test_record_failure();
+                }
+            }
+        });
+
+        // Ensure the writer thread stops even if the test panics.
+        struct StopGuard(Arc<AtomicBool>);
+        impl Drop for StopGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _guard = StopGuard(stop.clone());
+
+        // Call the production sort function many times while the writer
+        // thread concurrently modifies SRTT values. With sort_by_cached_key
+        // this is safe. With sort_by, the concurrent modifications cause
+        // inconsistent comparisons that panic the sort.
+        for _ in 0..100_000 {
+            sort_servers_by_query_statistics(&mut servers);
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
     }
 }

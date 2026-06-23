@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 use super::DNSSECRData;
 use crate::{
     dnssec::{Algorithm, PublicKey, Verifier, crypto::decode_public_key},
-    error::{ProtoError, ProtoResult},
+    error::ProtoResult,
     rr::{RecordData, RecordDataDecodable, RecordType, record_data::RData},
     serialize::binary::{
-        BinDecodable, BinDecoder, BinEncodable, BinEncoder, Restrict, RestrictedMath,
+        BinDecodable, BinDecoder, BinEncodable, BinEncoder, DecodeError, Restrict, RestrictedMath,
     },
 };
 
@@ -320,17 +320,17 @@ impl Verifier for KEY {
 
 impl BinEncodable for KEY {
     fn emit(&self, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        encoder.emit_u16(self.flags())?;
-        encoder.emit(u8::from(self.protocol))?;
+        self.flags().emit(encoder)?;
+        u8::from(self.protocol).emit(encoder)?;
         self.algorithm().emit(encoder)?;
-        encoder.emit_vec(self.public_key())?;
+        encoder.emit_slice(self.public_key())?;
 
         Ok(())
     }
 }
 
 impl<'r> RecordDataDecodable<'r> for KEY {
-    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> ProtoResult<KEY> {
+    fn read_data(decoder: &mut BinDecoder<'r>, length: Restrict<u16>) -> Result<Self, DecodeError> {
         //      0   1   2   3   4   5   6   7   8   9   0   1   2   3   4   5
         //    +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
         //    |  A/C  | Z | XT| Z | Z | NAMTYP| Z | Z | Z | Z |      SIG      |
@@ -343,7 +343,7 @@ impl<'r> RecordDataDecodable<'r> for KEY {
                 //    Bits 8-11 are reserved and must be zero.
                 flags & 0b0010_1100_1111_0000 == 0
             })
-            .map_err(|_| ProtoError::from("flag 2, 4-5, and 8-11 are reserved, must be zero"))?;
+            .map_err(DecodeError::KeyFlagsReserved)?;
 
         let key_trust = KeyTrust::from(flags);
         let extended_flags: bool = flags & 0b0001_0000_0000_0000 != 0;
@@ -351,8 +351,7 @@ impl<'r> RecordDataDecodable<'r> for KEY {
         let signatory = UpdateScope::from(flags);
 
         if extended_flags {
-            // TODO: add an optional field to return the raw u16?
-            return Err("extended flags currently not supported".into());
+            return Err(DecodeError::ExtendedKeyFlagsUnsupported(flags));
         }
 
         // TODO: protocol my be infallible
@@ -366,7 +365,7 @@ impl<'r> RecordDataDecodable<'r> for KEY {
         let key_len = length
         .map(|u| u as usize)
         .checked_sub(4)
-        .map_err(|_| ProtoError::from("invalid rdata length in KEY"))?
+        .map_err(|len| DecodeError::IncorrectRDataLengthRead { read: 4, len })?
         .unverified(/*used only as length safely*/);
         let public_key: Vec<u8> =
             decoder.read_vec(key_len)?.unverified(/*the byte array will fail in usage if invalid*/);
