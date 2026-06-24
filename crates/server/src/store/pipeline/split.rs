@@ -18,6 +18,9 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+#[cfg(feature = "metrics")]
+use crate::metrics::remote_list;
+
 use crate::{
     net::runtime::TokioRuntimeProvider,
     proto::rr::{LowerName, Name, RecordType},
@@ -124,6 +127,8 @@ impl SplitZoneHandler {
                 tokio::time::sleep(interval).await;
                 if let Err(e) = Self::reload_domains(&domains, &sources, &zone_dir).await {
                     warn!("split blocklist refresh failed: {e}");
+                    #[cfg(feature = "metrics")]
+                    remote_list::record_refresh("split", "all", false);
                 }
             }
         });
@@ -136,7 +141,24 @@ impl SplitZoneHandler {
     ) -> Result<(), String> {
         let mut set = HashSet::new();
         for source in sources {
-            let content = load_source(source, zone_dir).await?;
+            let content = match load_source(source, zone_dir).await {
+                Ok(content) => {
+                    #[cfg(feature = "metrics")]
+                    remote_list::record_refresh("split", &source.source, true);
+                    content
+                }
+                Err(e) if source.allow_failure => {
+                    warn!("split source {} failed: {e}", source.source);
+                    #[cfg(feature = "metrics")]
+                    remote_list::record_refresh("split", &source.source, false);
+                    continue;
+                }
+                Err(e) => {
+                    #[cfg(feature = "metrics")]
+                    remote_list::record_refresh("split", &source.source, false);
+                    return Err(e);
+                }
+            };
             for line in content.lines() {
                 let line = line.split('#').next().unwrap_or(line).trim();
                 if line.is_empty() {

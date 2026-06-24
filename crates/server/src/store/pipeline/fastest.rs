@@ -12,6 +12,9 @@ use futures_util::future::select_all;
 use serde::Deserialize;
 use tracing::debug;
 
+#[cfg(all(feature = "metrics", feature = "pipeline"))]
+use crate::metrics::pipeline::FastestMetrics;
+
 use crate::{
     net::runtime::TokioRuntimeProvider,
     proto::{
@@ -38,6 +41,8 @@ pub struct FastestConfig {
 pub struct FastestZoneHandler {
     origin: LowerName,
     handlers: Vec<Arc<ForwardZoneHandler<TokioRuntimeProvider>>>,
+    #[cfg(all(feature = "metrics", feature = "pipeline"))]
+    metrics: FastestMetrics,
 }
 
 impl FastestZoneHandler {
@@ -61,6 +66,8 @@ impl FastestZoneHandler {
         Ok(Self {
             origin: origin.into(),
             handlers,
+            #[cfg(all(feature = "metrics", feature = "pipeline"))]
+            metrics: FastestMetrics::new(),
         })
     }
 }
@@ -113,6 +120,8 @@ impl ZoneHandler for FastestZoneHandler {
                     return LookupControlFlow::Continue(Ok(lookup));
                 }
                 LookupControlFlow::Continue(Err(e)) | LookupControlFlow::Break(Err(e)) => {
+                    #[cfg(all(feature = "metrics", feature = "pipeline"))]
+                    self.metrics.upstream_errors.increment(1);
                     last_err = LookupControlFlow::Continue(Err(e));
                 }
                 LookupControlFlow::Skip => {}
