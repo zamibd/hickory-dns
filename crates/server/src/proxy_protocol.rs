@@ -156,10 +156,10 @@ mod tests {
     #[test]
     fn parse_ipv4_proxy_with_tenant_tlv() {
         let mut payload = Vec::new();
-        // src 203.0.113.1:12345 dst 10.0.0.1:5301
+        // src 203.0.113.1:12345 dst 10.0.0.1:53
         payload.extend_from_slice(&[203, 0, 113, 1, 10, 0, 0, 1]);
         payload.extend_from_slice(&49u16.to_be_bytes()); // src port
-        payload.extend_from_slice(&5301u16.to_be_bytes()); // dst port
+        payload.extend_from_slice(&53u16.to_be_bytes()); // dst port
         // tenant TLV
         payload.extend_from_slice(&TENANT_TLV_TYPE.to_be_bytes());
         payload.push(6);

@@ -13,7 +13,7 @@ RCODES = {0: "NOERROR", 3: "NXDOMAIN", 5: "REFUSED", 2: "SERVFAIL"}
 
 def pp2_header(src_ip: str = "203.0.113.50", src_port: int = 54321) -> bytes:
     src, dst = socket.inet_aton(src_ip), socket.inet_aton("127.0.0.1")
-    payload = src + dst + struct.pack("!HH", src_port, 5301)
+    payload = src + dst + struct.pack("!HH", src_port, 53)
     return PP2_SIG + bytes([0x21, 0x11]) + struct.pack("!H", len(payload)) + payload
 
 
@@ -65,7 +65,7 @@ def percentile(sorted_vals: list[float], p: float) -> float:
 
 def main():
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5301
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 53
     total = int(sys.argv[3]) if len(sys.argv) > 3 else 10000
     workers = int(sys.argv[4]) if len(sys.argv) > 4 else 50
     names = ["google.com", "bkash.com", "wikipedia.org", "example.com"]

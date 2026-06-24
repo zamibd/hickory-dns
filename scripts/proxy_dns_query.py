@@ -73,7 +73,7 @@ def parse_answer(data: bytes) -> str:
 
 if __name__ == "__main__":
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5301
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 53
     name = sys.argv[3]
     qtype = int(sys.argv[4]) if len(sys.argv) > 4 else 1
     tenant = sys.argv[5] if len(sys.argv) > 5 else None
