@@ -18,19 +18,16 @@ services:
   hickory-dns-1:
     <<: *hickory-dns-common
     ports:
-      - "5301:5301/tcp"
       - "9101:9000/tcp"
 
   hickory-dns-2:
     <<: *hickory-dns-common
     ports:
-      - "5302:5301/tcp"
       - "9102:9000/tcp"
 
   hickory-dns-3:
     <<: *hickory-dns-common
     ports:
-      - "5303:5301/tcp"
       - "9103:9000/tcp"
 
   haproxy:

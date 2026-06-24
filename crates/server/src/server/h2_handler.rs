@@ -150,7 +150,7 @@ pub(crate) async fn h2_handler(
     let mut h2 = match server::handshake(io).await {
         Ok(h2) => h2,
         Err(err) => {
-            warn!("handshake error from {}: {}", src_addr, err);
+            debug!(%src_addr, %err, "HTTP/2 handshake failed");
             return;
         }
     };

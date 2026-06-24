@@ -29,8 +29,8 @@ pub struct ProxyHeader {
 
 /// Read and parse a PROXY protocol v2 header from the start of a TCP stream.
 ///
-/// If the stream does not begin with a PROXY signature, returns `Ok(None)` and
-/// leaves the stream unread so the caller can treat it as a plain DNS connection.
+/// When `proxy_protocol` is enabled on the server, connections must begin with a
+/// valid PROXY v2 header. Invalid or missing headers are rejected by the caller.
 pub async fn read_proxy_header<R: AsyncRead + Unpin>(
     stream: &mut R,
 ) -> io::Result<Option<ProxyHeader>> {

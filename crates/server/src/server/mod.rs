@@ -512,6 +512,17 @@ async fn handle_udp(
     }
 }
 
+/// Returns true when a peer connected without PROXY v2 (scanners, health probes, plain DNS).
+fn proxy_protocol_rejection_is_expected(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
 async fn handle_tcp(
     listener: net::TcpListener,
     timeout: Duration,
@@ -545,7 +556,15 @@ async fn handle_tcp(
                 Ok(Some(hdr)) => (stream, hdr.src, hdr.tenant_id),
                 Ok(None) => (stream, peer_addr, None),
                 Err(error) => {
-                    warn!(%peer_addr, %error, "failed to parse PROXY protocol header");
+                    if proxy_protocol_rejection_is_expected(&error) {
+                        debug!(
+                            %peer_addr,
+                            %error,
+                            "rejected TCP connection without valid PROXY v2 header"
+                        );
+                    } else {
+                        warn!(%peer_addr, %error, "failed to parse PROXY protocol header");
+                    }
                     continue;
                 }
             }

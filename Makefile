@@ -16,7 +16,7 @@ help:
 	@echo "  ps             Show service status"
 	@echo "  health         Check metrics endpoints on all instances"
 	@echo "  test-pipeline  Run Rust pipeline integration tests"
-	@echo "  test-load      Run 10k PROXY v2 load test against instance 1"
+	@echo "  test-load      Run 10k PROXY v2 load test via HAProxy (:5353)"
 	@echo "  metrics        Print Prometheus scrape URLs"
 	@echo "  prometheus     Open Prometheus UI hint"
 	@echo "  reload-config  Restart backends to pick up config changes"
@@ -53,7 +53,7 @@ test-pipeline:
 	cargo test -p hickory-server --features pipeline,resolver,metrics test_build_forwarded_response_preserves_refused -- catalog::tests
 
 test-load:
-	python3 scripts/load_test_proxy.py 127.0.0.1 5301 10000 80
+	python3 scripts/load_test_proxy.py 127.0.0.1 5353 10000 80
 
 metrics:
 	@echo "Prometheus targets:"
