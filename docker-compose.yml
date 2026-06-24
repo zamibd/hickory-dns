@@ -3,11 +3,10 @@ services:
     build: .
     image: hickory-dns:latest
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
+      - "5301:5301/tcp"
       - "853:853"
       - "443:443"
     volumes:
       - ./config:/config
     restart: unless-stopped
-    command: -c /config/hickory-dns.toml -z /config/
+    command: -c /config/routedns-pipeline.toml -z /config/

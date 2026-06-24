@@ -36,6 +36,7 @@ pub use hickory_proto as proto;
 pub use hickory_resolver as resolver;
 
 mod access;
+pub mod proxy_protocol;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod server;

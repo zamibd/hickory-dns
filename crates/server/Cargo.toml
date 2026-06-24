@@ -29,6 +29,8 @@ recursor = ["hickory-resolver/recursor"]
 resolver = ["dep:hickory-resolver"]
 sqlite = ["dep:rusqlite"]
 blocklist = ["resolver"]
+pipeline = ["resolver"]
+remote-blocklist = ["dep:reqwest"]
 toml = ["dep:toml", "hickory-resolver?/toml"]
 metrics = ["hickory-resolver?/metrics", "dep:metrics"]
 
@@ -120,6 +122,7 @@ hickory-proto = { workspace = true, features = ["serde"] }
 hickory-net = { workspace = true, features = ["tokio"] }
 hickory-resolver = { workspace = true, features = ["serde", "system-config", "tokio"], optional = true }
 metrics = { workspace = true, optional = true }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "blocking"], optional = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true, default-features = false, features = ["std"] }

@@ -131,6 +131,24 @@ impl BlocklistZoneHandler {
             }
         }
 
+        for source in &config.sources {
+            info!("fetching remote blocklist {}", source.source);
+            match fetch_remote_blocklist(source) {
+                Ok(content) => {
+                    if let Err(e) = handler.add(io::Cursor::new(content)) {
+                        return Err(format!(
+                            "unable to add data from remote blocklist {}: {e:?}",
+                            source.source
+                        ));
+                    }
+                }
+                Err(e) if source.allow_failure => {
+                    warn!("remote blocklist {} failed: {e}", source.source);
+                }
+                Err(e) => return Err(format!("remote blocklist {} failed: {e}", source.source)),
+            }
+        }
+
         #[cfg(feature = "metrics")]
         handler.metrics.entries.set(handler.blocklist.len() as f64);
 
@@ -482,6 +500,21 @@ pub enum BlocklistConsultAction {
     Log,
 }
 
+/// Remote blocklist source (HTTP/HTTPS URL).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteBlocklistSource {
+    /// URL to fetch blocklist data from.
+    pub source: String,
+    /// Allow fetch failures without failing startup.
+    #[serde(default = "default_allow_failure")]
+    pub allow_failure: bool,
+}
+
+fn default_allow_failure() -> bool {
+    true
+}
+
 /// Configuration for blocklist zones
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -499,6 +532,10 @@ pub struct BlocklistConfig {
     /// Block lists to load.  These should be specified as relative (to the server zone directory)
     /// paths in the config file.
     pub lists: Vec<String>,
+
+    /// Remote blocklist sources (HTTP/HTTPS URLs). Requires the `remote-blocklist` feature.
+    #[serde(default)]
+    pub sources: Vec<RemoteBlocklistSource>,
 
     /// IPv4 sinkhole IP. This is the IP that is returned when a blocklist entry is matched for an
     /// A query. If unspecified, an implementation-provided default will be used.
@@ -533,6 +570,7 @@ impl Default for BlocklistConfig {
             wildcard_match: true,
             min_wildcard_depth: 2,
             lists: vec![],
+            sources: vec![],
             sinkhole_ipv4: None,
             sinkhole_ipv6: None,
             ttl: 86_400,
@@ -540,6 +578,25 @@ impl Default for BlocklistConfig {
             consult_action: BlocklistConsultAction::default(),
             log_clients: true,
         }
+    }
+}
+
+fn fetch_remote_blocklist(source: &RemoteBlocklistSource) -> Result<String, String> {
+    #[cfg(feature = "remote-blocklist")]
+    {
+        let response = reqwest::blocking::get(&source.source)
+            .map_err(|e| format!("HTTP fetch failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP status {}", response.status()));
+        }
+        response
+            .text()
+            .map_err(|e| format!("HTTP read failed: {e}"))
+    }
+    #[cfg(not(feature = "remote-blocklist"))]
+    {
+        let _ = source;
+        Err("remote blocklist sources require the remote-blocklist feature".to_string())
     }
 }
 

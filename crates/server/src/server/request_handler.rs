@@ -35,6 +35,8 @@ pub struct Request {
     pub(super) src: SocketAddr,
     /// Protocol of the request
     pub(super) protocol: Protocol,
+    /// Tenant identifier from PROXY protocol TLV 0xE1 (RouteDNS-compatible).
+    pub(crate) tenant_id: Option<String>,
 }
 
 impl Request {
@@ -44,6 +46,16 @@ impl Request {
         src: SocketAddr,
         protocol: Protocol,
     ) -> Result<Self, ProtoError> {
+        Self::from_bytes_with_tenant(raw, src, protocol, None)
+    }
+
+    /// Construct a new Request with an optional tenant identifier.
+    pub fn from_bytes_with_tenant(
+        raw: Vec<u8>,
+        src: SocketAddr,
+        protocol: Protocol,
+        tenant_id: Option<String>,
+    ) -> Result<Self, ProtoError> {
         let mut decoder = BinDecoder::new(&raw);
         let header = Header::read(&mut decoder)?;
         Ok(Self {
@@ -51,6 +63,7 @@ impl Request {
             raw: Bytes::from(raw),
             src,
             protocol,
+            tenant_id,
         })
     }
 
@@ -70,6 +83,7 @@ impl Request {
             raw: Bytes::from(encoded),
             src,
             protocol,
+            tenant_id: None,
         })
     }
 
@@ -82,7 +96,13 @@ impl Request {
             protocol: self.protocol,
             metadata: &self.message.metadata,
             query: &self.message.queries,
+            tenant_id: self.tenant_id.as_deref(),
         }
+    }
+
+    /// Tenant identifier from PROXY protocol TLV 0xE1, if present.
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
     }
 
     /// The IP address from which the request originated.
@@ -122,6 +142,8 @@ pub struct RequestInfo<'a> {
     pub metadata: &'a Metadata,
     /// The query from the request
     pub query: &'a LowerQuery,
+    /// Tenant identifier from PROXY protocol TLV 0xE1.
+    pub tenant_id: Option<&'a str>,
 }
 
 impl<'a> RequestInfo<'a> {
@@ -144,6 +166,7 @@ impl<'a> RequestInfo<'a> {
             protocol,
             metadata,
             query,
+            tenant_id: None,
         }
     }
 }

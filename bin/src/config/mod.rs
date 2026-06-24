@@ -49,6 +49,12 @@ use hickory_server::dnssec::NxProofKind;
 use hickory_server::net::runtime::TokioRuntimeProvider;
 #[cfg(feature = "blocklist")]
 use hickory_server::store::blocklist::{BlocklistConfig, BlocklistZoneHandler};
+#[cfg(feature = "pipeline")]
+use hickory_server::store::pipeline::{
+    FastestConfig, FastestZoneHandler, RateLimiterConfig, RateLimiterZoneHandler, RouterConfig,
+    RouterZoneHandler, SplitConfig, SplitZoneHandler, TenantRateLimiterConfig,
+    TenantRateLimiterZoneHandler, TtlModifierConfig, TtlModifierZoneHandler,
+};
 #[cfg(feature = "resolver")]
 use hickory_server::store::forwarder::{ForwardConfig, ForwardZoneHandler};
 #[cfg(feature = "recursor")]
@@ -166,6 +172,9 @@ pub(crate) struct Config {
     /// TCP socket configuration options.
     #[serde(default)]
     pub(crate) tcp_socket: TcpSocketConfig,
+    /// Parse HAProxy PROXY protocol v2 on incoming TCP connections.
+    #[serde(default)]
+    pub(crate) proxy_protocol: bool,
 }
 
 /// Configuration options for UDP sockets.
@@ -432,6 +441,38 @@ impl ZoneConfig {
 
                             Arc::new(recursor)
                         }
+                        #[cfg(feature = "pipeline")]
+                        ExternalStoreConfig::RateLimiter(config) => Arc::new(
+                            RateLimiterZoneHandler::try_from_config(zone_name.clone(), config)?,
+                        ),
+                        #[cfg(feature = "pipeline")]
+                        ExternalStoreConfig::TenantRateLimiter(config) => Arc::new(
+                            TenantRateLimiterZoneHandler::try_from_config(
+                                zone_name.clone(),
+                                config,
+                            )?,
+                        ),
+                        #[cfg(feature = "pipeline")]
+                        ExternalStoreConfig::Router(config) => Arc::new(
+                            RouterZoneHandler::try_from_config(zone_name.clone(), config)?,
+                        ),
+                        #[cfg(feature = "pipeline")]
+                        ExternalStoreConfig::Fastest(config) => Arc::new(
+                            FastestZoneHandler::try_from_config(zone_name.clone(), config)?,
+                        ),
+                        #[cfg(feature = "pipeline")]
+                        ExternalStoreConfig::Split(config) => Arc::new(
+                            SplitZoneHandler::try_from_config(
+                                zone_name.clone(),
+                                config,
+                                Some(zone_dir),
+                            )
+                            .await?,
+                        ),
+                        #[cfg(feature = "pipeline")]
+                        ExternalStoreConfig::TtlModifier(config) => Arc::new(
+                            TtlModifierZoneHandler::try_from_config(zone_name.clone(), config)?,
+                        ),
                         _ => return Err(ProtoError::from(EMPTY_STORES)),
                     };
 
@@ -580,6 +621,27 @@ pub(crate) enum ExternalStoreConfig {
     /// Recursive Resolver
     #[cfg(feature = "recursor")]
     Recursor(Box<RecursiveConfig>),
+    /// Per-IP rate limiter (RouteDNS-style)
+    #[cfg(feature = "pipeline")]
+    #[serde(rename = "rate_limiter")]
+    RateLimiter(RateLimiterConfig),
+    /// Per-tenant rate limiter (PPv2 TLV 0xE1)
+    #[cfg(feature = "pipeline")]
+    #[serde(rename = "tenant_rate_limiter")]
+    TenantRateLimiter(TenantRateLimiterConfig),
+    /// Query-type router with embedded forwarders
+    #[cfg(feature = "pipeline")]
+    Router(RouterConfig),
+    /// Race multiple upstream forwarders
+    #[cfg(feature = "pipeline")]
+    Fastest(FastestConfig),
+    /// Domain-list split routing
+    #[cfg(feature = "pipeline")]
+    Split(SplitConfig),
+    /// TTL clamping via consult phase
+    #[cfg(feature = "pipeline")]
+    #[serde(rename = "ttl_modifier")]
+    TtlModifier(TtlModifierConfig),
     /// This is used by the configuration processing code to represent a deprecated or main-block config without an associated store.
     #[default]
     Default,

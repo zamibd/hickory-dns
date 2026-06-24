@@ -29,6 +29,7 @@ ascii-art = []
 
 systemd = ["dep:sd-notify"]
 blocklist = ["hickory-server/blocklist"]
+pipeline = ["hickory-server/pipeline", "hickory-server/remote-blocklist"]
 recursor = ["hickory-server/recursor"]
 # Recursive Resolution is Experimental!
 resolver = ["hickory-server/resolver"]

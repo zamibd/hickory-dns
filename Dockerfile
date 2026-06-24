@@ -16,7 +16,7 @@ COPY . .
 # Build the hickory-dns binary
 # We explicitly enable features for a full-featured server
 # release profile is used for optimization
-RUN cargo build --release --bin hickory-dns --features sqlite,resolver,recursor,dnssec-ring,https-ring,tls-ring,quic-ring
+RUN cargo build --release --bin hickory-dns --features sqlite,resolver,recursor,blocklist,pipeline,remote-blocklist,dnssec-ring,https-ring,tls-ring,quic-ring
 
 # Runtime stage
 FROM alpine:latest

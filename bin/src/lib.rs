@@ -297,6 +297,7 @@ impl DnsServer {
             allow_networks,
             udp_socket: udp_socket_config,
             tcp_socket: tcp_socket_config,
+            proxy_protocol,
         } = config;
 
         #[cfg(unix)]
@@ -338,6 +339,10 @@ impl DnsServer {
         // now, run the server, based on the config
         #[cfg_attr(not(feature = "__tls"), allow(unused_mut))]
         let mut server = Server::with_access(catalog, deny_networks, allow_networks);
+        if proxy_protocol {
+            server.enable_proxy_protocol();
+            info!("PROXY protocol v2 parsing enabled on TCP listeners");
+        }
 
         let mut listen_addrs = listen_addrs_ipv4
             .into_iter()

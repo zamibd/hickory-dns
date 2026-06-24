@@ -73,6 +73,8 @@ pub use timeout_stream::TimeoutStream;
 pub struct Server<T: RequestHandler> {
     context: Arc<ServerContext<T>>,
     join_set: JoinSet<Result<(), NetError>>,
+    /// Parse HAProxy PROXY protocol v2 headers on incoming TCP connections.
+    proxy_protocol: bool,
 }
 
 impl<T: RequestHandler> Server<T> {
@@ -98,7 +100,17 @@ impl<T: RequestHandler> Server<T> {
                 shutdown: CancellationToken::new(),
             }),
             join_set: JoinSet::new(),
+            proxy_protocol: false,
         }
+    }
+
+    /// Enable HAProxy PROXY protocol v2 parsing on TCP listeners.
+    ///
+    /// When enabled, the server expects a PROXY header at the start of each TCP
+    /// connection (as sent by HAProxy with `send-proxy-v2`). The real client IP
+    /// and optional tenant TLV (0xE1) are extracted before DNS messages are read.
+    pub fn enable_proxy_protocol(&mut self) {
+        self.proxy_protocol = true;
     }
 
     /// Register a UDP socket. Should be bound before calling this function.
@@ -130,6 +142,7 @@ impl<T: RequestHandler> Server<T> {
             listener,
             timeout,
             response_buffer_size,
+            self.proxy_protocol,
             self.context.clone(),
         ));
     }
@@ -484,7 +497,7 @@ async fn handle_udp(
         let cx = cx.clone();
         let stream_handle = stream_handle.with_remote_addr(src_addr);
         inner_join_set.spawn(async move {
-            cx.handle_raw_request(message, Protocol::Udp, stream_handle)
+            cx.handle_raw_request(message, Protocol::Udp, stream_handle, None)
                 .await;
         });
 
@@ -503,12 +516,13 @@ async fn handle_tcp(
     listener: net::TcpListener,
     timeout: Duration,
     response_buffer_size: usize,
+    proxy_protocol: bool,
     cx: Arc<ServerContext<impl RequestHandler>>,
 ) -> Result<(), NetError> {
     debug!("register tcp: {listener:?}");
     let mut inner_join_set = JoinSet::new();
     loop {
-        let (tcp_stream, src_addr) = tokio::select! {
+        let (tcp_stream, peer_addr) = tokio::select! {
             tcp_stream = listener.accept() => match tcp_stream {
                 Ok((t, s)) => (t, s),
                 Err(error) => {
@@ -525,6 +539,20 @@ async fn handle_tcp(
             },
         };
 
+        let (tcp_stream, src_addr, tenant_id) = if proxy_protocol {
+            let mut stream = tcp_stream;
+            match crate::proxy_protocol::read_proxy_header(&mut stream).await {
+                Ok(Some(hdr)) => (stream, hdr.src, hdr.tenant_id),
+                Ok(None) => (stream, peer_addr, None),
+                Err(error) => {
+                    warn!(%peer_addr, %error, "failed to parse PROXY protocol header");
+                    continue;
+                }
+            }
+        } else {
+            (tcp_stream, peer_addr, None)
+        };
+
         // verify that the src address is safe for responses
         if let Err(error) = sanitize_src_address(src_addr) {
             warn!(
@@ -534,11 +562,9 @@ async fn handle_tcp(
             continue;
         }
 
-        // and spawn to the io_loop
         let cx = cx.clone();
         inner_join_set.spawn(async move {
             debug!(%src_addr, "accepted TCP request");
-            // take the created stream...
             let (buf_stream, stream_handle) = TcpStream::from_stream_with_buffer_size(
                 AsyncIoTokioAsStd(tcp_stream),
                 src_addr,
@@ -551,14 +577,17 @@ async fn handle_tcp(
                     Ok(message) => message,
                     Err(error) => {
                         debug!(%src_addr, %error, "error in TCP request stream");
-                        // we're going to bail on this connection...
                         return;
                     }
                 };
 
-                // we don't spawn here to limit clients from getting too many resources
-                cx.handle_raw_request(message, Protocol::Tcp, stream_handle.clone())
-                    .await;
+                cx.handle_raw_request(
+                    message,
+                    Protocol::Tcp,
+                    stream_handle.clone(),
+                    tenant_id.clone(),
+                )
+                .await;
             }
         });
 
@@ -647,7 +676,7 @@ async fn handle_tls(
                     }
                 };
 
-                cx.handle_raw_request(message, Protocol::Tls, stream_handle.clone())
+                cx.handle_raw_request(message, Protocol::Tls, stream_handle.clone(), None)
                     .await;
             }
         });
@@ -696,12 +725,19 @@ impl<T: RequestHandler> ServerContext<T> {
         message: SerialMessage,
         protocol: Protocol,
         response_handler: BufDnsStreamHandle,
+        tenant_id: Option<String>,
     ) {
         let (message, src_addr) = message.into_parts();
         let response_handler = ResponseHandle::new(src_addr, response_handler, protocol);
 
-        self.handle_request(Bytes::from(message), src_addr, protocol, response_handler)
-            .await;
+        self.handle_request(
+            Bytes::from(message),
+            src_addr,
+            protocol,
+            response_handler,
+            tenant_id,
+        )
+        .await;
     }
 
     async fn handle_request(
@@ -710,6 +746,7 @@ impl<T: RequestHandler> ServerContext<T> {
         src_addr: SocketAddr,
         protocol: Protocol,
         response_handler: impl ResponseHandler,
+        tenant_id: Option<String>,
     ) {
         let mut decoder = BinDecoder::new(&message_bytes);
         let Ok(header) = Header::read(&mut decoder) else {
@@ -785,6 +822,7 @@ impl<T: RequestHandler> ServerContext<T> {
                 raw: message_bytes,
                 src: src_addr,
                 protocol,
+                tenant_id,
             },
             Err(error) => {
                 error_response_handler(

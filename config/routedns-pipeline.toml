@@ -1,0 +1,101 @@
+##
+## Hickory DNS — RouteDNS-style pipeline configuration
+## Maintainer: RAHMAT AL ZAMI
+##
+## Topology:
+##   HAProxy (public :53) → Hickory (:5301 TCP + PROXY v2) → pipeline chain
+##
+## Query flow:
+##   rate_limiter → tenant_rate_limiter → adblock → router → split → fastest → ttl_modifier
+##
+
+# Listen on internal port for HAProxy backend (PROXY v2)
+listen_addrs_ipv4 = ["0.0.0.0"]
+listen_port = 5301
+disable_udp = true
+proxy_protocol = true
+
+tls_cert = { path = "/config/certs/cert.pem", private_key = "/config/certs/cert_key.pem" }
+tls_listen_port = 853
+https_listen_port = 443
+
+[[zones]]
+zone = "localhost"
+zone_type = "Primary"
+file = "default/localhost.zone"
+
+[[zones]]
+zone = "0.0.127.in-addr.arpa"
+zone_type = "Primary"
+file = "default/127.0.0.1.zone"
+
+[[zones]]
+zone = "."
+zone_type = "External"
+
+# Tier A: per client IP (PROXY v2) — 500 q/min
+[[zones.stores]]
+type = "rate_limiter"
+requests = 500
+window = 60
+prefix4 = 32
+prefix6 = 128
+
+# Tier B: per tenant (PPv2 TLV 0xE1) — 400 q/min
+[[zones.stores]]
+type = "tenant_rate_limiter"
+requests = 400
+window = 60
+
+# Ad-blocking (local or remote hosts list)
+[[zones.stores]]
+type = "blocklist"
+wildcard_match = true
+min_wildcard_depth = 2
+sinkhole_ipv4 = "0.0.0.0"
+lists = ["default/blocklist.txt"]
+sources = [
+  { source = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", allow_failure = true },
+]
+
+# Router: MX/TXT → Google DoT, default → split handler below
+[[zones.stores]]
+type = "router"
+routes = [
+  { types = ["MX"], forward = { name_servers = [
+    { ip = "8.8.8.8", trust_negative_responses = true, connections = [{ protocol = { type = "tls", server_name = "dns.google" } }] },
+  ] } },
+  { types = ["TXT"], forward = { name_servers = [
+    { ip = "8.8.8.8", trust_negative_responses = true, connections = [{ protocol = { type = "tls", server_name = "dns.google" } }] },
+  ] } },
+]
+
+# BD split: BD domains → Bangladesh resolvers, others → skip to fastest below
+[[zones.stores]]
+type = "split"
+blocklist_refresh = 3600
+blocklist_source = [
+  { source = "https://raw.githubusercontent.com/routedns/bd-domains/main/domains.txt", allow_failure = true },
+]
+match_forward = { name_servers = [
+  { ip = "103.187.22.195", trust_negative_responses = true, connections = [{ protocol = { type = "tcp" } }] },
+  { ip = "103.218.137.95", trust_negative_responses = true, connections = [{ protocol = { type = "tcp", port = 5353 } }] },
+] }
+
+# NextDNS DoQ ∥ Google DoT race
+[[zones.stores]]
+type = "fastest"
+forwards = [
+  { name_servers = [
+    { ip = "45.90.28.0", trust_negative_responses = true, connections = [{ protocol = { type = "quic", server_name = "routedns-bf159b.dns.nextdns.io" } }] },
+  ] },
+  { name_servers = [
+    { ip = "8.8.8.8", trust_negative_responses = true, connections = [{ protocol = { type = "tls", server_name = "dns.google" } }] },
+  ] },
+]
+
+# TTL shaping on responses
+[[zones.stores]]
+type = "ttl_modifier"
+ttl_min = 300
+ttl_max = 14400
