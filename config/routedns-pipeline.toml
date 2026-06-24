@@ -20,8 +20,9 @@ proxy_protocol = true
 # Prometheus metrics (scraped by deploy/prometheus)
 prometheus_listen_addr = "0.0.0.0:9000"
 
-# Only accept queries from private/docker networks (HAProxy backends)
-allow_networks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+# Restrict TCP peers (HAProxy/docker). PROXY v2 client IPs are not ACL'd.
+# Host-published UDP on Docker Desktop may use non-RFC1918 source IPs; test UDP from the compose network.
+allow_networks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "192.168.65.0/24"]
 
 tls_cert = { path = "/config/certs/cert.pem", private_key = "/config/certs/cert_key.pem" }
 https_listen_port = 443
