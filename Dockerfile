@@ -38,12 +38,8 @@ COPY --from=builder /app/target/release/hickory-dns .
 # Create a directory for config
 RUN mkdir -p /config
 
-# Expose standard DNS ports
-# 53: DNS (UDP/TCP)
-# 853: DoT (TCP)
-# 443: DoH (TCP - common)
-# 853: DoQ (UDP - commonly shares with DoT port or uses 853/784)
-EXPOSE 53/udp 53/tcp 853/tcp 443/tcp 853/udp
+# Expose pipeline defaults: HAProxy backend (PROXY v2) and DoH admin
+EXPOSE 5301/tcp 443/tcp
 
 # Set volume for persistence/config if needed
 VOLUME ["/config"]
