@@ -85,7 +85,10 @@ impl TenantRateLimiterZoneHandler {
             .as_secs();
         let window_id = now / self.config.window.max(1);
 
-        let mut state = self.state.lock().expect("tenant rate limiter lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("tenant rate limiter lock poisoned");
         if state.window_id != window_id {
             state.window_id = window_id;
             state.counts.clear();

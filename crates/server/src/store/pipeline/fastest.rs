@@ -94,8 +94,11 @@ impl ZoneHandler for FastestZoneHandler {
         lookup_options: LookupOptions,
     ) -> LookupControlFlow<AuthLookup> {
         let name = name.clone();
-        let mut futures: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = LookupControlFlow<AuthLookup>> + Send>>> =
-            Vec::with_capacity(self.handlers.len());
+        let mut futures: Vec<
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = LookupControlFlow<AuthLookup>> + Send>,
+            >,
+        > = Vec::with_capacity(self.handlers.len());
         for handler in &self.handlers {
             let handler = Arc::clone(handler);
             let name = name.clone();
@@ -107,9 +110,8 @@ impl ZoneHandler for FastestZoneHandler {
             }));
         }
 
-        let mut last_err = LookupControlFlow::Continue(Err(LookupError::ResponseCode(
-            ResponseCode::ServFail,
-        )));
+        let mut last_err =
+            LookupControlFlow::Continue(Err(LookupError::ResponseCode(ResponseCode::ServFail)));
 
         while !futures.is_empty() {
             let (result, _idx, remaining) = select_all(futures).await;

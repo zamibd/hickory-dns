@@ -199,7 +199,11 @@ async fn load_source(source: &BlocklistSource, zone_dir: &Path) -> Result<String
                 .map_err(|e| format!("HTTP fetch failed for {}: {e}", source.source))?;
             if !response.status().is_success() {
                 if source.allow_failure {
-                    warn!("HTTP fetch returned {} for {}", response.status(), source.source);
+                    warn!(
+                        "HTTP fetch returned {} for {}",
+                        response.status(),
+                        source.source
+                    );
                     return Ok(String::new());
                 }
                 return Err(format!(
@@ -220,8 +224,8 @@ async fn load_source(source: &BlocklistSource, zone_dir: &Path) -> Result<String
         }
     } else {
         let path = zone_dir.join(&source.source);
-        let mut file =
-            std::fs::File::open(&path).map_err(|e| format!("unable to open {}: {e}", path.display()))?;
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| format!("unable to open {}: {e}", path.display()))?;
         let mut content = String::new();
         file.read_to_string(&mut content)
             .map_err(|e: io::Error| format!("unable to read {}: {e}", path.display()))?;

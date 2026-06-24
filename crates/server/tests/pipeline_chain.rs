@@ -17,7 +17,11 @@ use hickory_server::zone_handler::{LookupControlFlow, LookupOptions, ZoneHandler
 
 fn request_info(ip: Ipv4Addr) -> RequestInfo<'static> {
     let query = Query::new(Name::from_str("example.com.").unwrap(), RecordType::A);
-    let metadata = Box::leak(Box::new(Metadata::new(1, MessageType::Query, OpCode::Query)));
+    let metadata = Box::leak(Box::new(Metadata::new(
+        1,
+        MessageType::Query,
+        OpCode::Query,
+    )));
     let lower_query = Box::leak(Box::new(LowerQuery::from(query)));
     RequestInfo::new(
         SocketAddr::new(IpAddr::V4(ip), 12345),
@@ -53,8 +57,7 @@ async fn pipeline_rate_limiter_then_blocklist() {
     )
     .unwrap();
 
-    let handlers: Vec<Arc<dyn ZoneHandler>> =
-        vec![Arc::new(rate_limiter), Arc::new(blocklist)];
+    let handlers: Vec<Arc<dyn ZoneHandler>> = vec![Arc::new(rate_limiter), Arc::new(blocklist)];
     let name = LowerName::from(Name::from_str("example.com.").unwrap());
     let info = request_info(Ipv4Addr::new(203, 0, 113, 99));
 
@@ -99,8 +102,7 @@ async fn pipeline_rate_limiter_refuses_before_blocklist() {
     )
     .unwrap();
 
-    let handlers: Vec<Arc<dyn ZoneHandler>> =
-        vec![Arc::new(rate_limiter), Arc::new(blocklist)];
+    let handlers: Vec<Arc<dyn ZoneHandler>> = vec![Arc::new(rate_limiter), Arc::new(blocklist)];
     let name = LowerName::from(Name::from_str("example.com.").unwrap());
     let info = request_info(Ipv4Addr::new(203, 0, 113, 1));
 
@@ -126,9 +128,11 @@ async fn pipeline_rate_limiter_refuses_before_blocklist() {
     assert!(
         matches!(
             flow,
-            LookupControlFlow::Break(Err(hickory_server::zone_handler::LookupError::ResponseCode(
-                hickory_proto::op::ResponseCode::Refused
-            )))
+            LookupControlFlow::Break(Err(
+                hickory_server::zone_handler::LookupError::ResponseCode(
+                    hickory_proto::op::ResponseCode::Refused
+                )
+            ))
         ),
         "expected rate limit refused"
     );

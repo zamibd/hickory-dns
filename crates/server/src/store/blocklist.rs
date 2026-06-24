@@ -26,9 +26,9 @@ use serde::Deserialize;
 use tracing::{info, trace, warn};
 
 #[cfg(feature = "metrics")]
-use crate::metrics::remote_list;
-#[cfg(feature = "metrics")]
 use crate::metrics::blocklist::BlocklistMetrics;
+#[cfg(feature = "metrics")]
+use crate::metrics::remote_list;
 #[cfg(feature = "__dnssec")]
 use crate::{dnssec::NxProofKind, zone_handler::Nsec3QueryInfo};
 use crate::{
@@ -99,9 +99,7 @@ impl BlocklistZoneHandler {
         let base_dir = match base_dir {
             Some(dir) => dir,
             None => {
-                return Err(
-                    "invalid blocklist (zone directory) base path specified".to_string(),
-                );
+                return Err("invalid blocklist (zone directory) base path specified".to_string());
             }
         };
 
@@ -177,10 +175,7 @@ impl BlocklistZoneHandler {
         }
 
         #[cfg(feature = "metrics")]
-        handler
-            .metrics
-            .entries
-            .set(handler.entry_count() as f64);
+        handler.metrics.entries.set(handler.entry_count() as f64);
 
         if handler.refresh > 0 && !handler.sources.is_empty() {
             handler.spawn_refresh_task();
@@ -241,7 +236,10 @@ impl BlocklistZoneHandler {
                     remote_list::record_refresh("blocklist", &source.source, true);
                 }
                 Err(e) if source.allow_failure => {
-                    warn!("remote blocklist {} failed during refresh: {e}", source.source);
+                    warn!(
+                        "remote blocklist {} failed during refresh: {e}",
+                        source.source
+                    );
                     #[cfg(feature = "metrics")]
                     remote_list::record_refresh("blocklist", &source.source, false);
                 }
@@ -373,10 +371,7 @@ impl BlocklistZoneHandler {
 
     /// Number of unique blocklist entries currently loaded in memory.
     pub fn entry_count(&self) -> usize {
-        self.blocklist
-            .read()
-            .map(|guard| guard.len())
-            .unwrap_or(0)
+        self.blocklist.read().map(|guard| guard.len()).unwrap_or(0)
     }
 
     /// Build a wildcard match list for a given host
@@ -404,14 +399,12 @@ impl BlocklistZoneHandler {
 
         trace!("blocklist match list: {match_list:?}");
 
-        match_list
-            .iter()
-            .any(|entry| {
-                self.blocklist
-                    .read()
-                    .map(|guard| guard.contains(entry))
-                    .unwrap_or(false)
-            })
+        match_list.iter().any(|entry| {
+            self.blocklist
+                .read()
+                .map(|guard| guard.contains(entry))
+                .unwrap_or(false)
+        })
     }
 
     /// Generate a BlocklistLookup to return on a blocklist match.  This will return a lookup with
